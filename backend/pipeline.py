@@ -44,7 +44,10 @@ PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 translator = GoogleTranslator(source="auto", target="km")
 
 import google.generativeai as genai
-import backend.voxcpm2 as voxcpm2
+try:
+    import backend.voxcpm2 as voxcpm2
+except ModuleNotFoundError:
+    import voxcpm2 as voxcpm2
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
