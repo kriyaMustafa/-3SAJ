@@ -24,11 +24,15 @@ _generate_lock = threading.Lock()
 
 def _resolve_model_source() -> tuple[str, dict[str, object]]:
     """Pick the best available VoxCPM2 source for this machine."""
+    local_model_dir = BASE_DIR.parent / "VoxCPM2_Model"
+    if (local_model_dir / "model.safetensors").exists():
+        return str(local_model_dir), {"local_files_only": True}
+
     env_path = os.getenv("VOXCPM2_MODEL_PATH", "").strip()
     if env_path and Path(env_path).is_dir():
         return env_path, {"local_files_only": True}
 
-    local_cache_dir = BASE_DIR.parent / "VoxCPM2_Model" / ".cache" / "huggingface"
+    local_cache_dir = local_model_dir / ".cache" / "huggingface"
     if local_cache_dir.exists():
         return "openbmb/VoxCPM2", {"cache_dir": str(local_cache_dir)}
 
