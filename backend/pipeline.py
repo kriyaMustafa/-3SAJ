@@ -44,6 +44,7 @@ PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 translator = GoogleTranslator(source="auto", target="km")
 
 import google.generativeai as genai
+import backend.voxcpm2 as voxcpm2
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -379,14 +380,23 @@ async def translate_transcript(transcript: list[dict[str, Any]]) -> list[str]:
 
 
 async def generate_khmer_audio(text: str, output_path: Path, speaker: Speaker) -> None:
-    communicate = edge_tts.Communicate(
-        text,
-        speaker.voice,
-        rate=speaker.rate,
-        pitch=speaker.pitch,
-        volume=speaker.volume,
+    # Use VoxCPM2 local model for high-fidelity Khmer TTS
+    style = {
+        "rate": speaker.rate,
+        "pitch": speaker.pitch,
+        "volume": speaker.volume
+    }
+    voice_profile = speaker.gender.lower()  # "male" or "female" or "kid"
+    
+    # voxcpm2.generate runs diffusion model inference which is synchronous, so we run it in a thread pool
+    await asyncio.to_thread(
+        voxcpm2.generate,
+        text=text,
+        output_path=str(output_path),
+        voice_profile=voice_profile,
+        target_lang="km",
+        style=style
     )
-    await communicate.save(str(output_path))
 
 
 def _speaker_from_profile(profile: str, index: int) -> Speaker:
