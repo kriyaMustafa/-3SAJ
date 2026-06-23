@@ -28,6 +28,7 @@ backend/whisper_models/
 # Frontend Build
 frontend/.next/
 frontend/out/
+frontend/dist/
 
 # Mobile Build
 mobile/build/
