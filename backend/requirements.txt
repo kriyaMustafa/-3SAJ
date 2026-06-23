@@ -1,0 +1,18 @@
+fastapi
+uvicorn
+python-multipart
+faster-whisper
+moviepy
+imageio-ffmpeg
+edge-tts
+deep-translator
+demucs
+torchcodec
+pydantic
+python-dotenv
+google-generativeai
+azure-cognitiveservices-speech
+# pyannote.audio # May require complex setup, consider API first if needed
+# torch
+# torchvision
+# torchaudio

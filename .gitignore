@@ -1,0 +1,45 @@
+# Environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project Specific
+*.mp4
+*.wav
+*.mp3
+*.m4a
+*.log
+*.json
+
+# Backend Data & Build
+backend/data/
+backend/build/
+backend/dist/
+backend/whisper_models/
+
+# Frontend Build
+frontend/.next/
+frontend/out/
+
+# Mobile Build
+mobile/build/
+mobile/.dart_tool/
+
+# Large local directories & models
+vox_env/
+temp_models/
+VoxCPM2_Model/
+data/
+
+# Environment files containing secrets
+.env
+.env.*
+backend/.env
