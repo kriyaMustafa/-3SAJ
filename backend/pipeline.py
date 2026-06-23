@@ -8,6 +8,9 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+
 from typing import Any, Callable
 import demucs.separate
 

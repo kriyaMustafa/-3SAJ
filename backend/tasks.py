@@ -1,5 +1,8 @@
 import os
 import sys
+from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 import time
 import math
 import json
@@ -930,7 +933,7 @@ def task_synthesize_tts_segment(project_id: str, segment_id: int, force_no_short
             return {"status": "skipped", "reason": "no_valid_translation", "audio_path": final_wav}
 
         # Determine TTS backend
-        tts_backend = os.getenv("TTS_BACKEND", "edge-tts").strip().lower()
+        tts_backend = os.getenv("TTS_BACKEND", "voxcpm2").strip().lower()
         tts_success = False
 
         # Clean text to synthesize (remove bracketed tags like [Khmer Dub] or unclosed [Khmer)

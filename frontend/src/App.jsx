@@ -24,11 +24,12 @@ function App() {
   const [isSubmitting, setIsSubmitting] = createSignal(false);
   const [previewMode, setPreviewMode] = createSignal("original"); // 'original' or 'dubbed'
 
+  // Resolve backend hosts dynamically
   const API_HOST = typeof window !== "undefined" 
-    ? `${window.location.hostname === "localhost" ? "127.0.0.1" : window.location.hostname}:8000` 
+    ? (window.location.port === "5173" || window.location.port === "3000" ? `${window.location.hostname}:8000` : window.location.host)
     : "127.0.0.1:8000";
-  const httpProtocol = "http://";
-  const wsProtocol = "ws://";
+  const httpProtocol = typeof window !== "undefined" && window.location.protocol === "https:" ? "https://" : "http://";
+  const wsProtocol = typeof window !== "undefined" && window.location.protocol === "https:" ? "wss://" : "ws://";
 
   // Fetch projects list on mount
   const fetchProjects = async () => {
@@ -58,7 +59,8 @@ function App() {
       if (res.ok) {
         const data = await res.json();
         setProjectDetails(data);
-        // Sync static pipeline state if socket isn't running
+        
+        // Sync static pipeline state
         setPipelineState({
           status: data.project.status,
           progress: data.project.progress || 0,
@@ -83,97 +85,101 @@ function App() {
     fetchProjectDetails(id);
   });
 
-  // Smart API polling loop — fetches real status FIRST before deciding to poll
+  // WebSocket Live Updates with Fallback to Smart Polling
   createEffect(() => {
     const id = selectedProjectId();
     if (!id) return;
 
-    const TERMINAL_STATES = ["completed", "failed", "cancelled"];
-    let timerId = null;
-    let stopped = false;
-    let currentDelay = 4000;
-    const maxDelay = 15000;
-    const backoffMultiplier = 1.5;
-    let lastStatus = null;
+    let ws = null;
+    let pollInterval = null;
+    let isTerminated = false;
 
-    const applyData = (data) => {
-      setProjectDetails(data);
-      const status = data.project.status;
-      setPipelineState({
-        status: status,
-        progress: data.project.progress || 0,
-        chunks: {
-          total: data.chunks.length,
-          completed: data.chunks.filter(c => c.status === "completed").length,
-          failed: data.chunks.filter(c => c.status === "failed").length
-        },
-        segments: {
-          total: data.segments.length,
-          completed: data.segments.filter(s => s.status === "synthesized").length
-        }
-      });
-      if (status !== lastStatus) {
-        fetchProjects();
-        lastStatus = status;
-      }
-      return status;
-    };
+    const connectWS = () => {
+      if (isTerminated) return;
+      const wsUrl = `${wsProtocol}${API_HOST}/ws/progress/${id}`;
+      console.log(`[WebSocket] Connecting to ${wsUrl}`);
+      ws = new WebSocket(wsUrl);
 
-    const poll = async () => {
-      if (stopped) return;
-      try {
-        const res = await fetch(`${httpProtocol}${API_HOST}/api/projects/${id}`);
-        if (res.ok) {
-          const data = await res.json();
-          const status = applyData(data);
-          currentDelay = 4000; // reset on success
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          setPipelineState({
+            status: data.status,
+            progress: data.progress,
+            chunks: data.chunks,
+            segments: data.segments
+          });
 
-          if (TERMINAL_STATES.includes(status)) {
-            console.log(`[Polling] Project ${id} reached terminal state "${status}". Polling stopped.`);
-            stopped = true;
-            return; // ← do NOT schedule next poll
+          // Sync project details on status transition or completion
+          if (["completed", "failed", "cancelled"].includes(data.status)) {
+            isTerminated = true;
+            ws.close();
+            fetchProjectDetails(id);
+            fetchProjects();
           }
-        } else {
-          currentDelay = Math.min(currentDelay * backoffMultiplier, maxDelay);
-          console.warn(`[Polling] Non-OK response. Backing off to ${currentDelay}ms`);
+        } catch (err) {
+          console.error("[WebSocket] Parse error:", err);
         }
-      } catch (err) {
-        currentDelay = Math.min(currentDelay * backoffMultiplier, maxDelay);
-        console.error(`[Polling] Network error. Backing off to ${currentDelay}ms`, err);
-      }
-      if (!stopped) {
-        timerId = setTimeout(poll, currentDelay);
-      }
+      };
+
+      ws.onclose = (event) => {
+        if (!isTerminated) {
+          console.warn("[WebSocket] Closed, starting smart fallback polling.");
+          startPolling();
+        }
+      };
+
+      ws.onerror = (err) => {
+        console.error("[WebSocket] Connection error:", err);
+        ws.close();
+      };
     };
 
-    // ── CRITICAL FIX: always fetch real status first, THEN decide whether to poll ──
-    const bootstrap = async () => {
-      try {
-        const res = await fetch(`${httpProtocol}${API_HOST}/api/projects/${id}`);
-        if (res.ok) {
-          const data = await res.json();
-          const status = applyData(data);
-          if (TERMINAL_STATES.includes(status)) {
-            console.log(`[Polling] Project ${id} already terminal ("${status}"). Polling will NOT start.`);
-            stopped = true;
-            return; // ← project is done, never schedule any poll
+    const startPolling = () => {
+      if (pollInterval) clearInterval(pollInterval);
+      pollInterval = setInterval(async () => {
+        if (isTerminated) {
+          clearInterval(pollInterval);
+          return;
+        }
+        try {
+          const res = await fetch(`${httpProtocol}${API_HOST}/api/projects/${id}`);
+          if (res.ok) {
+            const data = await res.json();
+            setPipelineState({
+              status: data.project.status,
+              progress: data.project.progress || 0,
+              chunks: {
+                total: data.chunks.length,
+                completed: data.chunks.filter(c => c.status === "completed").length,
+                failed: data.chunks.filter(c => c.status === "failed").length
+              },
+              segments: {
+                total: data.segments.length,
+                completed: data.segments.filter(s => s.status === "synthesized").length
+              }
+            });
+
+            if (["completed", "failed", "cancelled"].includes(data.project.status)) {
+              isTerminated = true;
+              clearInterval(pollInterval);
+              fetchProjectDetails(id);
+              fetchProjects();
+            }
           }
+        } catch (e) {
+          console.error("[Polling] Error fetching status:", e);
         }
-      } catch (e) {
-        console.error("[Polling] Bootstrap fetch failed:", e);
-      }
-      // Only reach here if status is non-terminal
-      if (!stopped) {
-        console.log(`[Polling] Project ${id} is active. Starting poll loop (${currentDelay}ms interval).`);
-        timerId = setTimeout(poll, currentDelay);
-      }
+      }, 4000);
     };
 
-    bootstrap();
+    // Initialize WS connection
+    connectWS();
 
     onCleanup(() => {
-      stopped = true;
-      if (timerId) clearTimeout(timerId);
+      isTerminated = true;
+      if (ws) ws.close();
+      if (pollInterval) clearInterval(pollInterval);
     });
   });
 
@@ -354,6 +360,7 @@ function App() {
   };
 
   const formatTimeStr = (sec) => {
+    if (sec == null) return "00:00.00";
     const minutes = Math.floor(sec / 60);
     const seconds = Math.floor(sec % 60);
     const ms = Math.floor((sec - Math.floor(sec)) * 100);
@@ -362,13 +369,13 @@ function App() {
 
   // Define steps for progress visualization
   const pipelineSteps = [
-    { key: "ingesting", label: "Ingesting Video & Splitting" },
-    { key: "stemming", label: "Vocal Stem Separation" },
-    { key: "transcribing", label: "Speech Transcription" },
-    { key: "translating", label: "Gemini Translation" },
-    { key: "synthesizing", label: "VoxCPM2 Speech Synthesis" },
-    { key: "exporting", label: "BGM Mixing & Subtitle Rendering" },
-    { key: "completed", label: "Pipeline Completed" }
+    { key: "ingesting", label: "Ingesting Video & Splitting", desc: "Downloading/parsing video file and running frame analysis." },
+    { key: "stemming", label: "Vocal Stem Separation (Demucs)", desc: "Splitting vocals from background audio tracks offline." },
+    { key: "transcribing", label: "Speech Transcription (Whisper)", desc: "Detecting dialogue markers and timestamping speech segments." },
+    { key: "translating", label: "Gemini Translation (Rolling Context)", desc: "Contextual translation into natural, paced Khmer text." },
+    { key: "synthesizing", label: "VoxCPM2 Speech Synthesis (Local)", desc: "Offline neural speech generation via GPU weights." },
+    { key: "exporting", label: "BGM Mixing & Subtitle Rendering", desc: "Auto-stretching audio and compositing the final dubbed video." },
+    { key: "completed", label: "Pipeline Completed", desc: "All dubbed video and metadata assets ready for export." }
   ];
 
   const getStepStatus = (stepKey) => {
@@ -386,243 +393,301 @@ function App() {
     return "pending";
   };
 
+  // Calculate statistics from segment list
+  const getStats = () => {
+    const details = projectDetails();
+    if (!details || !details.segments || details.segments.length === 0) {
+      return { duration: 0, characters: 0, speakers: 0 };
+    }
+    const maxTime = Math.max(...details.segments.map(s => s.end_time));
+    const minTime = Math.min(...details.segments.map(s => s.start_time));
+    const duration = Math.max(0, maxTime - minTime);
+    const characters = details.segments.reduce((acc, s) => acc + (s.translated_text?.length || 0), 0);
+    const speakers = new Set(details.segments.map(s => s.speaker_id?.toLowerCase())).size;
+    return { duration, characters, speakers };
+  };
+
   return (
-    <div class="flex h-screen bg-[#0f172a] text-slate-100 overflow-hidden">
+    <div class="flex h-screen bg-[#070c18] text-slate-100 overflow-hidden font-sans">
       
       {/* Sidebar - Projects Registry List */}
-      <div class="w-72 bg-[#1e293b] border-r border-slate-700 flex flex-col justify-between">
+      <div class="w-80 bg-[#0c1427]/90 backdrop-blur-xl border-r border-slate-800/80 flex flex-col justify-between shadow-2xl relative z-10">
         <div>
-          <div class="p-6 border-b border-slate-700 flex items-center gap-3">
-            <div class="bg-emerald-500 text-slate-900 p-2 rounded-lg">
+          {/* Logo & Header */}
+          <div class="p-6 border-b border-slate-800/80 bg-[#0f1a30]/20 flex items-center gap-3">
+            <div class="bg-gradient-to-tr from-emerald-400 to-teal-500 text-slate-950 p-2.5 rounded-xl shadow-lg shadow-emerald-500/20">
               <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
               </svg>
             </div>
             <div>
-              <h1 class="text-xl font-bold tracking-tight text-white">VocalTransl8</h1>
-              <p class="text-xs text-emerald-400 font-medium">Khmer Recap Pipeline</p>
+              <h1 class="text-lg font-black tracking-wider bg-clip-text text-transparent bg-gradient-to-r from-white via-slate-100 to-slate-400">VocalTransl8</h1>
+              <p class="text-[10px] text-emerald-400 font-extrabold uppercase tracking-widest">Orchestrator v2.0</p>
             </div>
           </div>
-          <div class="p-4">
-            <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Project Registry</h2>
-            <div class="space-y-1 overflow-y-auto max-h-[60vh] pr-1">
+
+          {/* Project Registry */}
+          <div class="p-5">
+            <div class="flex items-center justify-between mb-4">
+              <h2 class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Active Registry</h2>
+              <span class="text-[10px] bg-slate-800 text-slate-300 font-bold px-2 py-0.5 rounded-md">{projects().length} Jobs</span>
+            </div>
+            
+            <div class="space-y-2 overflow-y-auto max-h-[60vh] pr-1 custom-scrollbar">
               <For each={projects()}>
-                {(proj) => (
-                  <div
-                    onClick={() => setSelectedProjectId(proj.id)}
-                    class={`relative group w-full text-left p-3 rounded-lg flex flex-col cursor-pointer transition-all duration-200 ${
-                      selectedProjectId() === proj.id 
-                        ? "bg-emerald-500/10 border-l-4 border-emerald-500 text-white font-medium" 
-                        : "hover:bg-slate-800 text-slate-300"
-                    }`}
-                  >
-                    <div class="flex items-start justify-between">
-                      <span class="text-sm truncate w-40 font-semibold">{proj.name}</span>
-                      <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
-                        {/* Cancel Button */}
-                        {["pending", "ingesting", "stemming", "transcribing", "translating", "synthesizing", "exporting"].includes(proj.status) && (
+                {(proj) => {
+                  const isSelected = selectedProjectId() === proj.id;
+                  return (
+                    <div
+                      onClick={() => setSelectedProjectId(proj.id)}
+                      class={`group relative w-full text-left p-3.5 rounded-xl cursor-pointer transition-all duration-300 border ${
+                        isSelected 
+                          ? "bg-gradient-to-r from-[#10b981]/15 to-[#0b9064]/5 border-emerald-500/40 shadow-lg shadow-emerald-500/5 text-white" 
+                          : "bg-slate-900/40 border-slate-800/80 hover:border-slate-700/60 text-slate-300 hover:bg-slate-800/30"
+                      }`}
+                    >
+                      <div class="flex items-start justify-between gap-2">
+                        <span class={`text-xs truncate font-bold ${isSelected ? "text-emerald-300" : "text-slate-200"}`}>
+                          {proj.name}
+                        </span>
+                        
+                        {/* Control Actions (Cancel/Delete) */}
+                        <div class="flex items-center gap-1.5 opacity-0 group-hover:opacity-100 transition-all duration-200">
+                          {["pending", "ingesting", "stemming", "transcribing", "translating", "synthesizing", "exporting"].includes(proj.status) && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleCancelProject(proj.id);
+                              }}
+                              title="Cancel Pipeline"
+                              class="p-1 text-slate-400 hover:text-amber-400 hover:bg-slate-800 rounded-lg transition-colors border border-slate-800"
+                            >
+                              <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                              </svg>
+                            </button>
+                          )}
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
-                              handleCancelProject(proj.id);
+                              handleDeleteProject(proj.id);
                             }}
-                            title="Cancel / Stop Pipeline"
-                            class="p-0.5 text-slate-400 hover:text-amber-500 hover:bg-slate-700/50 rounded transition-colors"
+                            title="Delete Project Data"
+                            class="p-1 text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded-lg transition-colors border border-slate-800"
                           >
-                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                             </svg>
                           </button>
-                        )}
-                        {/* Delete Button */}
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDeleteProject(proj.id);
-                          }}
-                          title="Delete Project"
-                          class="p-0.5 text-slate-400 hover:text-rose-500 hover:bg-slate-700/50 rounded transition-colors"
-                        >
-                          <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                          </svg>
-                        </button>
+                        </div>
+                      </div>
+                      
+                      <div class="flex items-center justify-between w-full mt-2.5">
+                        <span class="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                          {proj.genre_mode === "anime_recap" ? "🎬 Anime Mode" : "🎭 Drama Mode"}
+                        </span>
+                        
+                        <span class={`text-[9px] px-2 py-0.5 rounded-full font-black uppercase border ${
+                          proj.status === "completed" ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" :
+                          proj.status === "failed" ? "bg-rose-500/10 text-rose-400 border-rose-500/20" :
+                          proj.status === "cancelled" ? "bg-slate-800 text-slate-400 border-slate-700" :
+                          "bg-amber-500/10 text-amber-400 border-amber-500/20 animate-pulse"
+                        }`}>{proj.status}</span>
                       </div>
                     </div>
-                    <div class="flex items-center justify-between w-full mt-1.5">
-                      <span class="text-xs text-slate-400">{proj.genre_mode === "anime_recap" ? "Anime Recap" : "Drama Recap"}</span>
-                      <span class={`text-[10px] px-1.5 py-0.5 rounded-full font-bold uppercase ${
-                        proj.status === "completed" ? "bg-emerald-500/20 text-emerald-400" :
-                        proj.status === "failed" ? "bg-rose-500/20 text-rose-400" :
-                        proj.status === "cancelled" ? "bg-slate-600/30 text-slate-400" :
-                        "bg-amber-500/20 text-amber-400 animate-pulse"
-                      }`}>{proj.status}</span>
-                    </div>
-                  </div>
-                )}
+                  );
+                }}
               </For>
             </div>
           </div>
         </div>
 
-        <div class="p-4 border-t border-slate-700 bg-slate-900 text-center">
-          <p class="text-[11px] text-slate-500">MSI Pulse 15 Laptop Hardware Node</p>
-          <div class="flex items-center justify-center gap-1.5 mt-1">
-            <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
-            <span class="text-xs text-slate-400">8GB VRAM Optimizer Active</span>
+        {/* Node GPU status */}
+        <div class="p-5 border-t border-slate-800/80 bg-[#0b101f]/80">
+          <div class="flex items-center gap-3 bg-slate-900/60 p-3 rounded-xl border border-slate-800/60">
+            <div class="relative flex h-3 w-3">
+              <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              <span class="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+            </div>
+            <div>
+              <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">VoxCPM2 Node Status</p>
+              <h3 class="text-xs font-black text-white mt-0.5">GPU Accel Active (BF16)</h3>
+            </div>
           </div>
         </div>
       </div>
 
       {/* Main Core Dashboard Grid */}
-      <div class="flex-1 flex flex-col overflow-hidden">
+      <div class="flex-1 flex flex-col overflow-hidden relative">
         
-        <div class="p-6 border-b border-slate-800 bg-[#1e293b]/50 overflow-y-auto max-h-[45vh]">
-          <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+        {/* Glowing Background Orbs */}
+        <div class="absolute top-0 right-0 w-96 h-96 bg-emerald-500/5 rounded-full filter blur-[100px] pointer-events-none"></div>
+        <div class="absolute bottom-0 left-1/4 w-96 h-96 bg-indigo-500/5 rounded-full filter blur-[100px] pointer-events-none"></div>
+
+        {/* Top Panel Section */}
+        <div class="p-6 border-b border-slate-800/60 bg-[#080d19]/40 overflow-y-auto max-h-[42vh] custom-scrollbar relative z-10">
+          <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
             
-            {/* Source Ingestion Tabs */}
-            <div class="bg-slate-900/60 border border-slate-700 rounded-xl p-5 shadow-2xl">
-              <h2 class="text-md font-bold mb-4 flex items-center gap-2 text-white">
-                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-                </svg>
-                Launch New Translation Pipeline
-              </h2>
-              <form onSubmit={handleStartPipeline} class="space-y-4">
+            {/* Launch New Translation Pipeline Panel */}
+            <div class="bg-gradient-to-b from-slate-900/70 to-slate-900/30 backdrop-blur-md border border-slate-800/80 rounded-2xl p-5 shadow-2xl flex flex-col justify-between">
+              <div>
+                <h2 class="text-sm font-black text-white uppercase tracking-widest mb-4 flex items-center gap-2">
+                  <span class="bg-emerald-500/10 text-emerald-400 p-1.5 rounded-lg">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4" />
+                    </svg>
+                  </span>
+                  Translate Pipeline
+                </h2>
                 
-                {/* Tabs selection */}
-                <div class="flex bg-slate-800 p-1 rounded-lg border border-slate-700">
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab("url")}
-                    class={`flex-1 text-center py-2 text-sm rounded-md transition-all font-medium ${
-                      activeTab() === "url" ? "bg-emerald-500 text-slate-900 font-bold" : "text-slate-400 hover:text-white"
-                    }`}
-                  >
-                    Remote Stream URL
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab("local")}
-                    class={`flex-1 text-center py-2 text-sm rounded-md transition-all font-medium ${
-                      activeTab() === "local" ? "bg-emerald-500 text-slate-900 font-bold" : "text-slate-400 hover:text-white"
-                    }`}
-                  >
-                    Drag & Drop Upload
-                  </button>
-                </div>
-
-                <Show when={activeTab() === "url"}>
-                  <div class="space-y-1">
-                    <label class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Video Stream Web URL</label>
-                    <input
-                      type="url"
-                      placeholder="e.g. YouTube, TikTok, Direct MP4 link"
-                      value={videoUrl()}
-                      onInput={(e) => setVideoUrl(e.target.value)}
-                      class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 text-sm focus:outline-none focus:border-emerald-500"
-                    />
+                <form onSubmit={handleStartPipeline} class="space-y-4">
+                  {/* Mode Tabs */}
+                  <div class="flex bg-slate-950/60 p-1 rounded-xl border border-slate-800/80">
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("url")}
+                      class={`flex-1 text-center py-2 text-xs rounded-lg transition-all font-bold ${
+                        activeTab() === "url" 
+                          ? "bg-gradient-to-r from-emerald-500 to-teal-500 text-slate-950 shadow-md" 
+                          : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      Remote URL
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("local")}
+                      class={`flex-1 text-center py-2 text-xs rounded-lg transition-all font-bold ${
+                        activeTab() === "local" 
+                          ? "bg-gradient-to-r from-emerald-500 to-teal-500 text-slate-950 shadow-md" 
+                          : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      Local Video
+                    </button>
                   </div>
-                </Show>
 
-                <Show when={activeTab() === "local"}>
-                  <div class="space-y-1">
-                    <label class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Upload Local Media</label>
-                    <div class="border-2 border-dashed border-slate-700 hover:border-emerald-500 rounded-lg p-6 text-center cursor-pointer transition-all duration-300 bg-slate-800/40">
+                  <Show when={activeTab() === "url"}>
+                    <div class="space-y-1">
+                      <label class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Video Stream URL</label>
                       <input
-                        type="file"
-                        accept="video/*"
-                        onChange={handleFileChange}
-                        class="hidden"
-                        id="fileUploadInput"
+                        type="url"
+                        placeholder="YouTube, TikTok or MP4 Web Link"
+                        value={videoUrl()}
+                        onInput={(e) => setVideoUrl(e.target.value)}
+                        class="w-full bg-slate-950/60 border border-slate-850 hover:border-slate-700/60 focus:border-emerald-500 rounded-xl px-3 py-2 text-slate-100 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500/20 transition-all font-medium"
                       />
-                      <label for="fileUploadInput" class="cursor-pointer">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="mx-auto h-8 w-8 text-slate-400 mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
-                        </svg>
-                        <span class="text-sm font-semibold block text-slate-200">
-                          {localFile() ? localFile().name : "Choose file or drag here"}
-                        </span>
-                        <span class="text-xs text-slate-500 mt-1 block">Supports up to 2GB MP4, MKV, AVI</span>
-                      </label>
+                    </div>
+                  </Show>
+
+                  <Show when={activeTab() === "local"}>
+                    <div class="space-y-1">
+                      <label class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Drag & Drop Media</label>
+                      <div class="border border-dashed border-slate-800 hover:border-emerald-500/50 rounded-xl p-4 text-center cursor-pointer transition-all duration-300 bg-slate-950/30 hover:bg-slate-950/60">
+                        <input
+                          type="file"
+                          accept="video/*"
+                          onChange={handleFileChange}
+                          class="hidden"
+                          id="fileUploadInput"
+                        />
+                        <label for="fileUploadInput" class="cursor-pointer">
+                          <svg xmlns="http://www.w3.org/2000/svg" class="mx-auto h-7 w-7 text-slate-500 mb-1.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                          </svg>
+                          <span class="text-xs font-black block text-slate-300">
+                            {localFile() ? localFile().name : "Choose Media File"}
+                          </span>
+                          <span class="text-[9px] text-slate-500 mt-0.5 block">Supports MP4, MKV up to 2GB</span>
+                        </label>
+                      </div>
+                    </div>
+                  </Show>
+
+                  {/* Settings Grid */}
+                  <div class="grid grid-cols-2 gap-3">
+                    <div class="space-y-1">
+                      <label class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Target Language</label>
+                      <select
+                        value={targetLang()}
+                        onChange={(e) => setTargetLang(e.target.value)}
+                        class="w-full bg-slate-950/60 border border-slate-850 focus:border-emerald-500 rounded-xl px-2.5 py-2 text-slate-100 text-xs focus:outline-none transition-all cursor-pointer font-bold"
+                      >
+                        <option value="km">Khmer (ភាសាខ្មែរ)</option>
+                        <option value="en">English</option>
+                        <option value="es">Spanish</option>
+                        <option value="vi">Vietnamese</option>
+                      </select>
+                    </div>
+                    <div class="space-y-1">
+                      <label class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Genre Setting</label>
+                      <select
+                        value={genreMode()}
+                        onChange={(e) => setGenreMode(e.target.value)}
+                        class="w-full bg-slate-950/60 border border-slate-850 focus:border-emerald-500 rounded-xl px-2.5 py-2 text-slate-100 text-xs focus:outline-none transition-all cursor-pointer font-bold"
+                      >
+                        <option value="anime_recap">Anime (Paced/Tight)</option>
+                        <option value="drama_recap">Drama (Dramatic)</option>
+                      </select>
                     </div>
                   </div>
-                </Show>
 
-                {/* Configuration Options */}
-                <div class="grid grid-cols-2 gap-4">
-                  <div class="space-y-1">
-                    <label class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Target Language</label>
-                    <select
-                      value={targetLang()}
-                      onChange={(e) => setTargetLang(e.target.value)}
-                      class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 text-sm focus:outline-none focus:border-emerald-500"
+                  <div class="flex items-center justify-between pt-2 border-t border-slate-850">
+                    <div class="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        id="shortsCheckbox"
+                        checked={generateShorts()}
+                        onChange={(e) => setGenerateShorts(e.target.checked)}
+                        class="w-4 h-4 text-emerald-500 border-slate-800 rounded focus:ring-emerald-500 bg-slate-950 focus:ring-offset-0"
+                      />
+                      <label for="shortsCheckbox" class="text-xs font-bold text-slate-400 select-none cursor-pointer">Export Shorts (9:16)</label>
+                    </div>
+                    
+                    <button
+                      type="submit"
+                      disabled={isSubmitting()}
+                      class="bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 disabled:from-slate-850 disabled:to-slate-800 disabled:text-slate-500 text-slate-950 font-black px-4 py-2.5 rounded-xl text-xs flex items-center gap-1.5 transition-all duration-300 shadow-lg shadow-emerald-500/10 active:scale-95 cursor-pointer"
                     >
-                      <option value="km">Khmer (default)</option>
-                      <option value="en">English</option>
-                      <option value="es">Spanish</option>
-                      <option value="zh">Chinese</option>
-                      <option value="vi">Vietnamese</option>
-                    </select>
+                      {isSubmitting() ? "Synthesizing..." : "Run Dubbing"}
+                      <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
+                        <path fill-rule="evenodd" d="M10.293 3.293a1 1 0 011.414 0l6 6a1 1 0 010 1.414l-6 6a1 1 0 01-1.414-1.414L14.586 11H3a1 1 0 110-2h11.586l-4.293-4.293a1 1 0 010-1.414z" clip-rule="evenodd" />
+                      </svg>
+                    </button>
                   </div>
-                  <div class="space-y-1">
-                    <label class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Genre Setting</label>
-                    <select
-                      value={genreMode()}
-                      onChange={(e) => setGenreMode(e.target.value)}
-                      class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 text-sm focus:outline-none focus:border-emerald-500"
-                    >
-                      <option value="anime_recap">Anime Mode (Fast/Punchy)</option>
-                      <option value="drama_recap">Drama Mode (Dramatic/Steady)</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div class="flex items-center justify-between pt-2">
-                  <div class="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      id="shortsCheckbox"
-                      checked={generateShorts()}
-                      onChange={(e) => setGenerateShorts(e.target.checked)}
-                      class="w-4 h-4 text-emerald-500 border-slate-700 rounded focus:ring-emerald-500 bg-slate-800"
-                    />
-                    <label for="shortsCheckbox" class="text-sm text-slate-300 select-none">Generate TikTok/Shorts (9:16)</label>
-                  </div>
-                  <button
-                    type="submit"
-                    disabled={isSubmitting()}
-                    class="bg-emerald-500 hover:bg-emerald-600 disabled:bg-slate-700 text-slate-900 font-bold px-5 py-2.5 rounded-lg shadow-lg hover:shadow-emerald-500/10 flex items-center gap-2 text-sm transition-all duration-300"
-                  >
-                    {isSubmitting() ? "Starting..." : "Begin Pipeline"}
-                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                      <path fill-rule="evenodd" d="M10.293 3.293a1 1 0 011.414 0l6 6a1 1 0 010 1.414l-6 6a1 1 0 01-1.414-1.414L14.586 11H3a1 1 0 110-2h11.586l-4.293-4.293a1 1 0 010-1.414z" clip-rule="evenodd" />
-                    </svg>
-                  </button>
-                </div>
-              </form>
+                </form>
+              </div>
             </div>
 
             {/* Panel A: Media Player Preview */}
-            <div class="bg-slate-900/60 border border-slate-700 rounded-xl p-5 shadow-2xl flex flex-col justify-between">
+            <div class="bg-gradient-to-b from-slate-900/70 to-slate-900/30 backdrop-blur-md border border-slate-800/80 rounded-2xl p-5 shadow-2xl flex flex-col justify-between">
               <div>
-                <h2 class="text-md font-bold mb-4 flex items-center gap-2 text-white">
-                  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                  Panel A: Media Player Preview
+                <h2 class="text-sm font-black text-white uppercase tracking-widest mb-4 flex items-center justify-between">
+                  <span class="flex items-center gap-2">
+                    <span class="bg-indigo-500/10 text-indigo-400 p-1.5 rounded-lg">
+                      <svg xmlns="http://www.w3.org/2000/svg" class="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                      </svg>
+                    </span>
+                    Panel A: Media Player
+                  </span>
+                  <Show when={selectedProjectId() && projectDetails()}>
+                    <span class="text-[10px] font-bold bg-slate-800 text-slate-300 px-2 py-0.5 rounded border border-slate-700 capitalize">{previewMode()} Mode</span>
+                  </Show>
                 </h2>
                 
                 <Show
                   when={selectedProjectId() && projectDetails()}
                   fallback={
-                    <div class="bg-slate-950/80 rounded-lg aspect-video flex flex-col items-center justify-center text-slate-500 border border-slate-800 h-44">
-                      <p class="text-xs">Select or start a project to preview</p>
+                    <div class="bg-slate-950/60 rounded-xl aspect-video flex flex-col items-center justify-center text-slate-500 border border-slate-850/80 h-40">
+                      <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-slate-650 mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                      </svg>
+                      <p class="text-[10px] font-black uppercase tracking-widest text-slate-600">No Project Selected</p>
                     </div>
                   }
                 >
-                  <div class="relative rounded-lg overflow-hidden aspect-video bg-black border border-slate-800 mb-4 h-44 flex items-center justify-center">
+                  <div class="relative rounded-xl overflow-hidden aspect-video bg-black border border-slate-850 shadow-2xl h-40 flex items-center justify-center group/video">
                     <video
                       id="mainVideoPlayer"
                       src={
@@ -635,13 +700,15 @@ function App() {
                     />
                   </div>
                   
-                  <div class="flex items-center justify-between gap-2">
-                    <div class="flex bg-slate-800 p-1 rounded-lg border border-slate-700">
+                  <div class="flex items-center justify-between gap-4 mt-3 pt-3 border-t border-slate-850">
+                    <div class="flex bg-slate-950/60 p-1 rounded-xl border border-slate-800/80">
                       <button
                         type="button"
                         onClick={() => setPreviewMode("original")}
-                        class={`px-3 py-1.5 text-xs rounded transition-all font-semibold ${
-                          previewMode() === "original" ? "bg-slate-700 text-white font-bold" : "text-slate-400 hover:text-white"
+                        class={`px-3 py-1.5 text-[10px] rounded-lg transition-all font-black uppercase tracking-wider ${
+                          previewMode() === "original" 
+                            ? "bg-slate-800 text-white border border-slate-700/60 shadow-md" 
+                            : "text-slate-400 hover:text-white"
                         }`}
                       >
                         Original
@@ -650,67 +717,73 @@ function App() {
                         type="button"
                         disabled={projectDetails()?.project.status !== "completed"}
                         onClick={() => setPreviewMode("dubbed")}
-                        class={`px-3 py-1.5 text-xs rounded transition-all font-semibold ${
-                          previewMode() === "dubbed" ? "bg-emerald-500 text-slate-950 font-bold" : "text-slate-400 hover:text-white disabled:opacity-50"
+                        class={`px-3 py-1.5 text-[10px] rounded-lg transition-all font-black uppercase tracking-wider ${
+                          previewMode() === "dubbed" 
+                            ? "bg-gradient-to-r from-emerald-500 to-teal-500 text-slate-950 font-black" 
+                            : "text-slate-400 hover:text-white disabled:opacity-30 disabled:pointer-events-none"
                         }`}
                       >
                         Khmer Dubbed
                       </button>
                     </div>
                     
-                    <span class="text-[11px] text-slate-400 font-medium">
-                      Audio: <span class="text-white font-bold capitalize">{previewMode()}</span>
+                    <span class="text-[10px] text-slate-400 font-extrabold uppercase tracking-wider">
+                      Stereo Audio Output
                     </span>
                   </div>
                 </Show>
               </div>
             </div>
 
-            {/* Real-time Pipeline Progress Tracker */}
-            <div class="bg-slate-900/60 border border-slate-700 rounded-xl p-5 shadow-2xl flex flex-col justify-between">
+            {/* Panel C: Worker Cluster Status / Live Pipeline Tracker */}
+            <div class="bg-gradient-to-b from-slate-900/70 to-slate-900/30 backdrop-blur-md border border-slate-800/80 rounded-2xl p-5 shadow-2xl flex flex-col justify-between">
               <div>
-                <h2 class="text-md font-bold mb-3.5 flex items-center justify-between text-white">
+                <h2 class="text-sm font-black text-white uppercase tracking-widest mb-3.5 flex items-center justify-between">
                   <span class="flex items-center gap-2">
-                    <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping"></span>
-                    Worker Cluster Status
+                    <span class="bg-emerald-500/10 text-emerald-400 p-1.5 rounded-lg flex items-center">
+                      <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+                    </span>
+                    Live Worker Cluster
                   </span>
-                  <span class="text-emerald-400 font-mono text-sm">{pipelineState().progress}%</span>
+                  <span class="text-emerald-400 font-mono text-xs font-black">{pipelineState().progress}%</span>
                 </h2>
                 
-                <div class="w-full bg-slate-800 rounded-full h-2.5 mb-6 overflow-hidden border border-slate-700">
+                <div class="w-full bg-slate-950 rounded-full h-2 mb-4 overflow-hidden border border-slate-850">
                   <div
-                    class="bg-emerald-500 h-2.5 rounded-full transition-all duration-500"
+                    class="bg-gradient-to-r from-emerald-400 to-teal-500 h-2 rounded-full transition-all duration-700 shadow-[0_0_8px_rgba(16,185,129,0.3)]"
                     style={{ width: `${pipelineState().progress}%` }}
                   ></div>
                 </div>
 
-                <div class="space-y-3.5">
+                <div class="space-y-2 overflow-y-auto max-h-[17vh] custom-scrollbar pr-1">
                   <For each={pipelineSteps}>
                     {(step) => {
                       const status = getStepStatus(step.key);
                       return (
-                        <div class="flex items-center justify-between text-xs sm:text-sm">
-                          <div class="flex items-center gap-3">
-                            <span class={`w-5 h-5 rounded-full flex items-center justify-center font-bold text-[10px] ${
-                              status === "completed" ? "bg-emerald-500 text-slate-900" :
-                              status === "active" ? "bg-amber-500 text-slate-900 animate-pulse" :
+                        <div class="flex items-start justify-between text-[11px] py-1 border-b border-slate-900/60 last:border-b-0">
+                          <div class="flex items-start gap-2.5">
+                            <span class={`w-4 h-4 rounded-full flex items-center justify-center font-black text-[9px] mt-0.5 ${
+                              status === "completed" ? "bg-emerald-500 text-slate-950" :
+                              status === "active" ? "bg-amber-500 text-slate-950 animate-pulse" :
                               status === "failed" ? "bg-rose-500 text-white" :
-                              "bg-slate-800 text-slate-500 border border-slate-700"
+                              "bg-slate-950 text-slate-650 border border-slate-850"
                             }`}>
-                              {status === "completed" ? "✓" : "!"}
+                              {status === "completed" ? "✓" : "•"}
                             </span>
-                            <span class={`font-medium ${
-                              status === "active" ? "text-amber-400" :
-                              status === "completed" ? "text-slate-200" :
-                              status === "failed" ? "text-rose-400" :
-                              "text-slate-500"
-                            }`}>{step.label}</span>
+                            <div>
+                              <p class={`font-black ${
+                                status === "active" ? "text-amber-400" :
+                                status === "completed" ? "text-slate-200" :
+                                status === "failed" ? "text-rose-400" :
+                                "text-slate-500"
+                              }`}>{step.label}</p>
+                            </div>
                           </div>
-                          <span class={`text-[10px] font-bold uppercase tracking-wider ${
+                          <span class={`text-[9px] font-black uppercase tracking-widest ${
                             status === "completed" ? "text-emerald-400" :
                             status === "active" ? "text-amber-400" :
                             status === "failed" ? "text-rose-400" :
-                            "text-slate-600"
+                            "text-slate-700"
                           }`}>{status}</span>
                         </div>
                       );
@@ -719,75 +792,89 @@ function App() {
                 </div>
               </div>
 
-              <div class="grid grid-cols-2 gap-4 mt-6 pt-4 border-t border-slate-800 text-xs text-slate-400 font-semibold">
-                <div class="flex justify-between items-center bg-slate-800/40 p-2.5 rounded-lg border border-slate-800">
-                  <span>60s Video Chunks:</span>
-                  <span class="text-white font-mono">{pipelineState().chunks.completed} / {pipelineState().chunks.total}</span>
+              <div class="grid grid-cols-2 gap-3 mt-4 pt-3 border-t border-slate-850 text-[10px] text-slate-400 font-bold uppercase tracking-wider">
+                <div class="flex justify-between items-center bg-slate-950/40 p-2 rounded-xl border border-slate-850">
+                  <span>60s Chunks</span>
+                  <span class="text-white font-mono font-bold">{pipelineState().chunks.completed} / {pipelineState().chunks.total}</span>
                 </div>
-                <div class="flex justify-between items-center bg-slate-800/40 p-2.5 rounded-lg border border-slate-800">
-                  <span>Subtitle Lines Dubbed:</span>
-                  <span class="text-white font-mono">{pipelineState().segments.completed} / {pipelineState().segments.total}</span>
+                <div class="flex justify-between items-center bg-slate-950/40 p-2 rounded-xl border border-slate-850">
+                  <span>Lines Dubbed</span>
+                  <span class="text-white font-mono font-bold">{pipelineState().segments.completed} / {pipelineState().segments.total}</span>
                 </div>
               </div>
-
             </div>
 
           </div>
         </div>
 
-        {/* Interactive Translation Edit Grid */}
-        <div class="flex-1 flex flex-col min-h-0 bg-[#0f172a] border-t border-slate-800">
-          <div class="px-6 py-4 border-b border-slate-800 flex justify-between items-center bg-slate-900/40">
+        {/* Interactive Translation Edit Workspace (Panel B) */}
+        <div class="flex-1 flex flex-col min-h-0 bg-[#070c18]/90 relative z-10">
+          <div class="px-6 py-4 border-b border-slate-800/80 flex flex-col sm:flex-row justify-between sm:items-center bg-[#0a1224]/30 gap-4">
             <div>
-              <h2 class="text-lg font-bold text-white">Interactive Segment Script Workspace</h2>
-              <p class="text-xs text-slate-400">Review transcription, customize Khmer translation overrides, and trigger selective node audio updates.</p>
+              <h2 class="text-md font-black text-white uppercase tracking-wider flex items-center gap-2">
+                <span class="bg-emerald-500/10 text-emerald-400 px-2 py-0.5 rounded text-[10px] font-black">Panel B</span>
+                Dialogue Dubbing Workspace
+              </h2>
+              <p class="text-xs text-slate-400 mt-0.5">Edit transcription translation alignment and trigger offline selective neural synthesis.</p>
             </div>
-            <div class="bg-slate-800 border border-slate-700 px-3 py-1.5 rounded-lg text-xs flex gap-4 text-slate-300 font-medium">
-              <span>Selected Project ID: <span class="font-mono text-white text-xs">{selectedProjectId() ? selectedProjectId().substring(0, 8) : "None"}</span></span>
-            </div>
+            
+            <Show when={projectDetails()}>
+              <div class="flex flex-wrap items-center gap-3">
+                {/* Statistics Cards */}
+                <div class="bg-slate-900/60 border border-slate-800 px-3 py-1.5 rounded-xl text-[10px] font-bold text-slate-400 flex items-center gap-1.5">
+                  Duration: <span class="text-white font-mono text-xs">{formatTimeStr(getStats().duration)}</span>
+                </div>
+                <div class="bg-slate-900/60 border border-slate-800 px-3 py-1.5 rounded-xl text-[10px] font-bold text-slate-400 flex items-center gap-1.5">
+                  Speakers: <span class="text-white text-xs">{getStats().speakers}</span>
+                </div>
+                <div class="bg-slate-900/60 border border-slate-800 px-3 py-1.5 rounded-xl text-[10px] font-bold text-slate-400 flex items-center gap-1.5">
+                  Characters: <span class="text-white font-mono text-xs">{getStats().characters}</span>
+                </div>
+              </div>
+            </Show>
           </div>
 
-          <div class="flex-1 overflow-y-auto p-6">
+          <div class="flex-1 overflow-y-auto p-6 custom-scrollbar">
             <Show
               when={projectDetails() && projectDetails().segments.length > 0}
               fallback={
-                <div class="flex flex-col items-center justify-center h-full text-slate-500 py-12">
-                  <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 mb-3 text-slate-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <div class="flex flex-col items-center justify-center h-full text-slate-500 py-12 border border-dashed border-slate-850 rounded-2xl bg-slate-900/10">
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-10 w-10 mb-2.5 text-slate-700 animate-pulse" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
                   </svg>
-                  <p class="text-sm font-semibold">No transcript segments found.</p>
-                  <p class="text-xs text-slate-600 mt-1">Start a new pipeline or select a registry item to inspect logs.</p>
+                  <p class="text-xs font-black uppercase tracking-widest text-slate-600">No Dialogue Segments Found</p>
+                  <p class="text-[10px] text-slate-650 mt-1">Select or launch a project to display the dubbing logs.</p>
                 </div>
               }
             >
-              <div class="w-full border border-slate-800 rounded-xl overflow-hidden shadow-xl bg-slate-900/40">
+              <div class="w-full border border-slate-850/80 rounded-2xl overflow-hidden shadow-2xl bg-slate-950/30">
                 <table class="w-full text-left border-collapse text-xs sm:text-sm">
                   <thead>
-                    <tr class="bg-slate-800 text-slate-300 font-semibold uppercase tracking-wider text-xs border-b border-slate-700">
-                      <th class="p-4 w-28">Timestamp</th>
+                    <tr class="bg-[#0f172a]/80 text-slate-400 font-black uppercase tracking-wider text-[10px] border-b border-slate-850">
+                      <th class="p-4 w-28">Timeline</th>
                       <th class="p-4 w-28">Speaker</th>
-                      <th class="p-4">Original Translation</th>
-                      <th class="p-4">Khmer Dubbing Script</th>
-                      <th class="p-4 w-44 text-center">Execution Control</th>
+                      <th class="p-4">Original Text</th>
+                      <th class="p-4">Khmer Translation Override</th>
+                      <th class="p-4 w-44 text-center">Synthesis Trigger</th>
                     </tr>
                   </thead>
-                  <tbody class="divide-y divide-slate-800">
+                  <tbody class="divide-y divide-slate-900/60">
                     <For each={projectDetails()?.segments}>
                       {(seg) => (
-                        <tr class="hover:bg-slate-800/40 transition-colors duration-150">
-                          <td class="p-4 font-mono text-emerald-400 font-semibold whitespace-nowrap">
+                        <tr class="hover:bg-slate-900/30 transition-colors duration-150 group">
+                          <td class="p-4 font-mono text-emerald-400 font-bold whitespace-nowrap">
                             {formatTimeStr(seg.start_time)} <br/>
-                            <span class="text-slate-500 font-normal">→ {formatTimeStr(seg.end_time)}</span>
+                            <span class="text-slate-500 font-semibold text-[10px]">→ {formatTimeStr(seg.end_time)}</span>
                           </td>
                           <td class="p-4 whitespace-nowrap">
                             <select
                               value={seg.speaker_id?.toLowerCase() || "male"}
                               onChange={(e) => handleUpdateSegmentSpeaker(seg.id, e.target.value)}
-                              class="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-slate-300 text-xs font-semibold focus:outline-none focus:border-emerald-500 hover:border-slate-600 transition-colors cursor-pointer"
+                              class="bg-slate-950 border border-slate-800 hover:border-slate-700/60 rounded-xl px-2.5 py-1.5 text-slate-300 text-xs font-bold focus:outline-none focus:border-emerald-500 transition-all cursor-pointer shadow-inner"
                             >
-                              <option value="male">Male Voice</option>
-                              <option value="female">Female Voice</option>
-                              <option value="kid">Kid Voice</option>
+                              <option value="male">🗣️ Male Voice</option>
+                              <option value="female">👧 Female Voice</option>
+                              <option value="kid">👶 Kid Voice</option>
                             </select>
                           </td>
                           <td class="p-4 text-slate-300 max-w-xs md:max-w-md font-medium leading-relaxed">
@@ -798,26 +885,26 @@ function App() {
                               value={seg.translated_text || ""}
                               onChange={(e) => handleUpdateSegmentText(seg.id, e.target.value)}
                               rows="2"
-                              class="w-full bg-slate-900 border border-slate-700 hover:border-slate-600 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 rounded-lg p-2 text-slate-100 text-xs sm:text-sm resize-none focus:outline-none transition-all duration-200"
-                              placeholder="Type Khmer translation here..."
+                              class="w-full bg-slate-950/80 border border-slate-800 hover:border-slate-700/60 focus:border-emerald-500/80 focus:ring-1 focus:ring-emerald-500/20 rounded-xl p-2.5 text-slate-100 text-xs font-semibold resize-none focus:outline-none transition-all duration-200 shadow-inner"
+                              placeholder="Input target translation..."
                             />
                           </td>
                           <td class="p-4 text-center">
                             <div class="flex flex-col items-center gap-2">
-                              <span class={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase ${
-                                seg.status === "synthesized" ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/20" :
-                                seg.status === "translated" ? "bg-amber-500/20 text-amber-400 border border-amber-500/20 animate-pulse" :
-                                seg.status === "failed" ? "bg-rose-500/20 text-rose-400 border border-rose-500/20" :
-                                "bg-slate-700/20 text-slate-400 border border-slate-700/20"
+                              <span class={`text-[9px] font-black px-2.5 py-0.5 rounded-full uppercase tracking-wider border ${
+                                seg.status === "synthesized" ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" :
+                                seg.status === "translated" ? "bg-amber-500/10 text-amber-400 border-amber-500/20 animate-pulse" :
+                                seg.status === "failed" ? "bg-rose-500/10 text-rose-400 border-rose-500/20" :
+                                "bg-slate-800 text-slate-400 border-slate-700"
                               }`}>{seg.status}</span>
                               <button
                                 onClick={() => handleReRenderSegment(seg.id)}
-                                class="bg-slate-800 hover:bg-emerald-500/10 hover:text-emerald-400 border border-slate-700 hover:border-emerald-500 text-slate-300 px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1 transition-all duration-200"
+                                class="bg-slate-900 hover:bg-emerald-500/10 hover:text-emerald-400 border border-slate-800 hover:border-emerald-500/50 text-slate-300 px-2.5 py-1.5 rounded-xl text-[10px] font-black flex items-center gap-1 transition-all duration-200 active:scale-95 cursor-pointer"
                               >
-                                <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
                                   <path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 110 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.005a1 1 0 01.737.824 5.002 5.002 0 009.254 1.671H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd" />
                                 </svg>
-                                Render Segment
+                                Synthesis Node
                               </button>
                             </div>
                           </td>
@@ -833,33 +920,36 @@ function App() {
 
         {/* Action Footer & Visual Carousel */}
         <Show when={projectDetails() && projectDetails().project.status === "completed"}>
-          <div class="p-6 border-t border-slate-800 bg-[#1e293b]/70 flex flex-col gap-6">
+          <div class="p-6 border-t border-slate-800/80 bg-[#090f1e]/85 backdrop-blur-md flex flex-col gap-5 relative z-10">
             
             {/* Visual Thumbnail Score Carousel */}
             <div>
-              <h3 class="text-sm font-bold text-slate-300 uppercase tracking-wider mb-3">AI Vision Scored Thumbnails (Top Engagement Scenes)</h3>
-              <div class="flex gap-4 overflow-x-auto pb-2 scrollbar-thin">
+              <h3 class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3 flex items-center gap-1.5">
+                <span class="w-1.5 h-1.5 rounded-full bg-indigo-400"></span>
+                AI Visual Engagement Highlights (Highest Engagement Frames)
+              </h3>
+              <div class="flex gap-4 overflow-x-auto pb-2 scrollbar-thin custom-scrollbar">
                 <For each={projectDetails()?.thumbnails}>
                   {(thumb) => (
-                    <div class="relative w-48 bg-slate-900 border border-slate-700 rounded-lg overflow-hidden flex-shrink-0 group">
+                    <div class="relative w-48 bg-slate-950/80 border border-slate-850 rounded-xl overflow-hidden flex-shrink-0 group shadow-xl">
                       <img
                         src={`${httpProtocol}${API_HOST}/api/downloads/${selectedProjectId()}/thumbnail/${thumb.filename}`}
-                        alt={`Scored: ${thumb.score}`}
-                        class="w-full h-28 object-cover group-hover:scale-105 transition-transform duration-300"
+                        alt={`Scene score: ${thumb.score}`}
+                        class="w-full h-26 object-cover group-hover:scale-105 transition-transform duration-300"
                       />
-                      <div class="absolute top-2 left-2 bg-emerald-500 text-slate-955 text-[10px] font-bold px-1.5 py-0.5 rounded shadow">
+                      <div class="absolute top-2 left-2 bg-gradient-to-r from-amber-400 to-orange-500 text-slate-950 text-[9px] font-black px-1.5 py-0.5 rounded shadow-lg flex items-center gap-0.5">
                         ★ {thumb.score.toFixed(1)}
                       </div>
-                      <div class="absolute bottom-2 right-2 bg-black/70 text-slate-300 text-[10px] font-mono px-1.5 py-0.5 rounded">
+                      <div class="absolute bottom-2 right-2 bg-black/85 text-slate-300 text-[9px] font-mono font-bold px-1.5 py-0.5 rounded border border-slate-800">
                         {formatTimeStr(thumb.timestamp)}
                       </div>
-                      <div class="p-2 text-center">
+                      <div class="p-2 bg-slate-900/40 text-center border-t border-slate-900/60">
                         <a
                           href={`${httpProtocol}${API_HOST}/api/downloads/${selectedProjectId()}/thumbnail/${thumb.filename}`}
                           download
-                          class="text-xs text-emerald-400 hover:text-emerald-300 font-bold block"
+                          class="text-[10px] text-emerald-400 hover:text-emerald-300 font-extrabold uppercase tracking-wide block transition-colors"
                         >
-                          Download Thumbnail
+                          Save Frame
                         </a>
                       </div>
                     </div>
@@ -869,43 +959,47 @@ function App() {
             </div>
 
             {/* Final Export Download Anchors */}
-            <div class="flex flex-col sm:flex-row items-center justify-between gap-4 border-t border-slate-800 pt-4">
+            <div class="flex flex-col sm:flex-row items-center justify-between gap-4 border-t border-slate-800/80 pt-4">
               <div class="flex items-center gap-2">
-                <span class="w-3 h-3 rounded-full bg-emerald-500"></span>
-                <span class="text-sm text-slate-300 font-semibold">Khmer Dubbed Production Assets Ready for Publishing!</span>
+                <span class="relative flex h-3 w-3">
+                  <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span class="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+                </span>
+                <span class="text-xs text-slate-300 font-black uppercase tracking-wider">Khmer Dubbed Production Assets Ready</span>
               </div>
-              <div class="flex flex-wrap gap-3">
+              
+              <div class="flex flex-wrap gap-2.5">
                 <a
                   href={`${httpProtocol}${API_HOST}/api/downloads/${selectedProjectId()}/video/16_9`}
                   target="_blank"
-                  class="bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-bold px-5 py-2.5 rounded-lg shadow-lg hover:shadow-emerald-500/10 flex items-center gap-2 text-sm transition-all duration-300"
+                  class="bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-slate-950 font-black px-5 py-2.5 rounded-xl shadow-lg shadow-emerald-500/10 hover:shadow-emerald-500/25 flex items-center gap-1.5 text-xs transition-all duration-300 active:scale-95"
                 >
-                  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                   </svg>
-                  Download Video (16:9)
+                  Video (16:9)
                 </a>
 
                 <Show when={projectDetails()?.project.generate_shorts}>
                   <a
                     href={`${httpProtocol}${API_HOST}/api/downloads/${selectedProjectId()}/video/9_16`}
                     target="_blank"
-                    class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-bold px-5 py-2.5 rounded-lg flex items-center gap-2 text-sm transition-all duration-300"
+                    class="bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-100 font-black px-5 py-2.5 rounded-xl flex items-center gap-1.5 text-xs transition-all duration-300 active:scale-95"
                   >
-                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z" />
                     </svg>
-                    Download Shorts (9:16)
+                    Shorts (9:16)
                   </a>
                 </Show>
 
                 <a
                   href={`${httpProtocol}${API_HOST}/api/downloads/${selectedProjectId()}/audio/mp3`}
                   target="_blank"
-                  class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-bold px-5 py-2.5 rounded-lg flex items-center gap-2 text-sm transition-all duration-300"
+                  class="bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-100 font-black px-5 py-2.5 rounded-xl flex items-center gap-1.5 text-xs transition-all duration-300 active:scale-95"
                 >
-                  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
                   </svg>
                   Export MP3
                 </a>
@@ -913,10 +1007,10 @@ function App() {
                 <a
                   href={`${httpProtocol}${API_HOST}/api/downloads/${selectedProjectId()}/subtitles/srt`}
                   target="_blank"
-                  class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-bold px-5 py-2.5 rounded-lg flex items-center gap-2 text-sm transition-all duration-300"
+                  class="bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-100 font-black px-5 py-2.5 rounded-xl flex items-center gap-1.5 text-xs transition-all duration-300 active:scale-95"
                 >
-                  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 8h10M7 12h4m1 8l-4-4H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-3l-4 4z" />
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M7 8h10M7 12h4m1 8l-4-4H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-3l-4 4z" />
                   </svg>
                   Export SRT
                 </a>

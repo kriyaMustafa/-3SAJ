@@ -2,6 +2,8 @@ import os
 import threading
 import re
 from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
 import numpy as np
 import soundfile as sf
