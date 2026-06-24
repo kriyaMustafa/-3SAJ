@@ -1,7 +1,47 @@
 import os
+import sys
+import glob
+
+# Prevent loading incompatible system-wide CUDA DLLs by filtering them from PATH and environment on Windows
+if os.name == 'nt':
+    for k in list(os.environ.keys()):
+        if "CUDA_PATH" in k.upper():
+            os.environ.pop(k, None)
+    _paths = os.environ.get("PATH", "").split(";")
+    _filtered = [p for p in _paths if "NVIDIA GPU Computing Toolkit" not in p]
+    os.environ["PATH"] = ";".join(_filtered)
+
+    # Automatically resolve the virtual environment path and add its NVIDIA/Torch binaries to the DLL search directories
+    try:
+        venv_root = os.path.dirname(os.path.dirname(sys.executable))
+        nvidia_dirs = glob.glob(os.path.join(venv_root, "Lib", "site-packages", "nvidia", "*", "bin"))
+        for d in nvidia_dirs:
+            if os.path.exists(d):
+                os.add_dll_directory(d)
+        
+        torch_lib = os.path.join(venv_root, "Lib", "site-packages", "torch", "lib")
+        if os.path.exists(torch_lib):
+            os.add_dll_directory(torch_lib)
+            
+        # Pre-import torch to force loading of the correct cuDNN/CUDA DLLs first
+        import torch
+        print(f"[DLL Isolation] PyTorch pre-loaded. CUDA available: {torch.cuda.is_available()}")
+    except Exception as dll_err:
+        print(f"[DLL Isolation Warning] Failed to configure isolated DLL paths: {dll_err}")
+
+
+
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+
+# Log API Key status on startup
+_api_key = os.getenv("GEMINI_API_KEY")
+if _api_key:
+    _masked = _api_key[:4] + "..." + _api_key[-4:] if len(_api_key) > 8 else "..."
+    print(f"[Startup] Gemini API Key loaded: {_masked} (length: {len(_api_key)})")
+else:
+    print("[Startup] WARNING: Gemini API Key is missing or empty in environment!")
 
 import uuid
 import asyncio
@@ -51,7 +91,6 @@ if not frontend_dir:
     @app.get("/")
     async def root():
         return {"status": "running", "service": "Video Translation Orchestrator API", "docs": "/docs"}
-
 
 @app.get("/app")
 async def app_redirect():
@@ -108,10 +147,17 @@ class WebSocketManager:
             for connection in self.active_connections[project_id]:
                 try:
                     await connection.send_json(message)
+                except WebSocketDisconnect:
+                    print(f"[WebSocket] Client disconnected during broadcast, will be removed.")
                 except Exception as e:
-                    print(f"[WebSocket] Broadcast error: {e}")
+                    print(f"[WebSocket] Broadcast error to a client: {e}")
 
 ws_manager = WebSocketManager()
+
+@app.websocket("/ws/progress/{project_id}")
+async def websocket_progress(websocket: WebSocket, project_id: str):
+    await websocket.accept()
+    await websocket.close(code=1000)
 
 @app.post("/api/projects")
 async def create_project(
@@ -127,10 +173,24 @@ async def create_project(
     source_language = payload.get("source_language", "en")
     target_language = payload.get("target_language", "km")
     genre_mode = payload.get("genre_mode", "anime_recap")
+    narrator_voice = payload.get("narrator_voice", "male")
+    enable_background_sound = payload.get("enable_background_sound", True)
+    enable_noise_cleaning = payload.get("enable_noise_cleaning", True)
+    enable_subtitles = payload.get("enable_subtitles", True)
+    tts_engine = payload.get("tts_engine", "voxcpm2")
     generate_shorts = payload.get("generate_shorts", False)
 
     if not input_type or not input_source:
         raise HTTPException(status_code=400, detail="Missing required parameters")
+
+    # Only keep 1 video: delete all existing projects first to free up storage
+    existing_projects = db.query(models.Project).all()
+    for p in existing_projects:
+        db.delete(p)
+        project_dir = os.path.join(DATA_DIR, p.id)
+        if os.path.exists(project_dir):
+            shutil.rmtree(project_dir, ignore_errors=True)
+    db.commit()
 
     project_id = str(uuid.uuid4())
     project_name = os.path.basename(input_source) if input_type == "local" else f"remote_stream_{project_id[:8]}"
@@ -143,6 +203,11 @@ async def create_project(
         source_language=source_language,
         target_language=target_language,
         genre_mode=genre_mode,
+        narrator_voice=narrator_voice,
+        enable_background_sound=enable_background_sound,
+        enable_noise_cleaning=enable_noise_cleaning,
+        enable_subtitles=enable_subtitles,
+        tts_engine=tts_engine,
         generate_shorts=generate_shorts,
         status="pending"
     )
@@ -205,6 +270,10 @@ async def get_project_details(project_id: str, db: Session = Depends(get_db)):
     elif project.status == "ingesting":
         progress_percentage = 10
 
+    project_dir = os.path.join(DATA_DIR, project.id)
+    prompts_file_path = os.path.join(project_dir, "manual_prompts.txt")
+    manual_prompts_file = os.path.abspath(prompts_file_path) if os.path.exists(prompts_file_path) else None
+
     return {
         "project": {
             "id": project.id,
@@ -214,7 +283,13 @@ async def get_project_details(project_id: str, db: Session = Depends(get_db)):
             "source_language": project.source_language,
             "target_language": project.target_language,
             "genre_mode": project.genre_mode,
+            "narrator_voice": project.narrator_voice,
+            "enable_background_sound": project.enable_background_sound,
+            "enable_noise_cleaning": getattr(project, "enable_noise_cleaning", True),
+            "enable_subtitles": getattr(project, "enable_subtitles", True),
+            "tts_engine": getattr(project, "tts_engine", "voxcpm2"),
             "generate_shorts": project.generate_shorts,
+            "manual_prompts_file": manual_prompts_file,
             "status": project.status,
             "progress": progress_percentage,
             "output_video_16_9": project.output_video_16_9,
@@ -239,6 +314,8 @@ async def get_project_details(project_id: str, db: Session = Depends(get_db)):
                 "end_time": s.end_time,
                 "original_text": s.original_text,
                 "translated_text": s.translated_text,
+                "ai_prompt": s.ai_prompt,
+                "detected_voice_type": s.detected_voice_type,
                 "status": s.status,
                 "error": s.error_traceback
             } for s in segments
@@ -252,6 +329,36 @@ async def get_project_details(project_id: str, db: Session = Depends(get_db)):
             } for t in thumbnails
         ]
     }
+
+
+@app.put("/api/projects/{project_id}")
+async def update_project_settings(
+    project_id: str,
+    payload: dict,
+    db: Session = Depends(get_db)
+):
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if "narrator_voice" in payload:
+        project.narrator_voice = payload["narrator_voice"]
+    if "genre_mode" in payload:
+        project.genre_mode = payload["genre_mode"]
+    if "enable_background_sound" in payload:
+        project.enable_background_sound = payload["enable_background_sound"]
+    if "enable_noise_cleaning" in payload:
+        project.enable_noise_cleaning = payload["enable_noise_cleaning"]
+    if "enable_subtitles" in payload:
+        project.enable_subtitles = payload["enable_subtitles"]
+    if "tts_engine" in payload:
+        project.tts_engine = payload["tts_engine"]
+    if "generate_shorts" in payload:
+        project.generate_shorts = payload["generate_shorts"]
+
+    db.commit()
+    return {"message": "Project settings updated successfully"}
+
 
 @app.put("/api/projects/{project_id}/segments/{segment_id}")
 async def update_segment(
@@ -307,6 +414,375 @@ async def render_segment(
     dispatch_task(task_synthesize_tts_segment, project_id, segment_id, background_tasks=background_tasks)
     return {"message": "Segment re-rendering scheduled", "segment_id": segment_id}
 
+
+@app.post("/api/projects/{project_id}/segments/batch-translate")
+async def batch_translate_segments(
+    project_id: str,
+    payload: dict,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """
+    Accept manual translations for segments that failed API quota.
+    Dispatches TTS synthesis for each successfully translated segment.
+    """
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    translations = payload.get("translations", [])
+    if not translations:
+        raise HTTPException(status_code=400, detail="No translations provided")
+
+    success_count = 0
+    errors = []
+
+    for item in translations:
+        segment_id = item.get("segment_id")
+        translated_text = item.get("translated_text", "").strip()
+
+        if not segment_id or not translated_text:
+            errors.append({"segment_id": segment_id, "error": "Missing segment_id or translated_text"})
+            continue
+
+        segment = db.query(models.Segment).filter(
+            models.Segment.project_id == project_id,
+            models.Segment.id == segment_id
+        ).first()
+
+        if not segment:
+            errors.append({"segment_id": segment_id, "error": "Segment not found"})
+            continue
+
+        segment.translated_text = translated_text
+        segment.status = "translated"
+        segment.ai_prompt = None  # Clear the prompt since translation is now provided
+        db.commit()
+
+        success_count += 1
+
+    if success_count > 0:
+        # Check if ALL segments in the project are translated
+        all_segments = db.query(models.Segment).filter(models.Segment.project_id == project_id).all()
+        all_translated = all(s.translated_text for s in all_segments)
+        
+        if all_translated:
+            project.status = "synthesizing"
+            db.commit()
+            
+            # Dispatch TTS for all translated segments now
+            for s in all_segments:
+                if s.status == "translated":
+                    dispatch_task(task_synthesize_tts_segment, project_id, s.id, background_tasks=background_tasks)
+
+    return {
+        "message": f"Batch translation completed",
+        "success_count": success_count,
+        "error_count": len(errors),
+        "errors": errors
+    }
+
+
+import json
+
+def get_default_voice_mapping(db: Session, project_id: str) -> dict:
+    segments = db.query(models.Segment).filter(models.Segment.project_id == project_id).all()
+    mapping = {}
+    for seg in segments:
+        spk = seg.speaker_id or "Speaker_Female"
+        if spk not in mapping:
+            detected = seg.detected_voice_type or "female"
+            # Default rate/pitch adjustments
+            rate = "+0%"
+            pitch = "+0Hz"
+            if detected == "elder_male":
+                rate = "-2%"
+                pitch = "-4Hz"
+            elif detected == "elder_female":
+                rate = "-2%"
+                pitch = "-2Hz"
+            elif detected == "male":
+                rate = "+4%"
+                pitch = "-2Hz"
+            elif detected == "kid":
+                rate = "+2%"
+                pitch = "+4Hz"
+            
+            mapping[spk] = {
+                "voice": detected,
+                "rate": rate,
+                "pitch": pitch
+            }
+    return mapping
+
+
+@app.get("/api/projects/{project_id}/voice-mapping")
+async def get_project_voice_mapping(project_id: str, db: Session = Depends(get_db)):
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_dir = os.path.join(DATA_DIR, project_id)
+    voice_mapping_path = os.path.join(project_dir, "voice_mapping.json")
+
+    mapping = {}
+    if os.path.exists(voice_mapping_path):
+        try:
+            with open(voice_mapping_path, "r", encoding="utf-8") as f:
+                mapping = json.load(f)
+        except Exception:
+            mapping = {}
+
+    # If mapping is empty or missing speakers, populate them automatically
+    default_map = get_default_voice_mapping(db, project_id)
+    updated = False
+    for spk, config in default_map.items():
+        if spk not in mapping:
+            mapping[spk] = config
+            updated = True
+
+    if updated or not os.path.exists(voice_mapping_path):
+        os.makedirs(project_dir, exist_ok=True)
+        try:
+            with open(voice_mapping_path, "w", encoding="utf-8") as f:
+                json.dump(mapping, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"Error saving default voice mapping: {e}")
+
+    return mapping
+
+
+@app.post("/api/projects/{project_id}/voice-mapping")
+async def update_project_voice_mapping(project_id: str, payload: dict, db: Session = Depends(get_db)):
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_dir = os.path.join(DATA_DIR, project_id)
+    voice_mapping_path = os.path.join(project_dir, "voice_mapping.json")
+
+    mapping = {}
+    if os.path.exists(voice_mapping_path):
+        try:
+            with open(voice_mapping_path, "r", encoding="utf-8") as f:
+                mapping = json.load(f)
+        except Exception:
+            pass
+
+    # Update mapping with incoming payload
+    for spk, config in payload.items():
+        if isinstance(config, dict):
+            mapping[spk] = {
+                "voice": config.get("voice", "female"),
+                "rate": config.get("rate", "+0%"),
+                "pitch": config.get("pitch", "+0Hz")
+            }
+
+    # Save mapping
+    os.makedirs(project_dir, exist_ok=True)
+    try:
+        with open(voice_mapping_path, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save voice mapping: {e}")
+
+    # Set status of affected segments back to 'translated' so they get re-rendered with new voices
+    updated_speakers = list(payload.keys())
+    segments = db.query(models.Segment).filter(
+        models.Segment.project_id == project_id,
+        models.Segment.speaker_id.in_(updated_speakers)
+    ).all()
+    for seg in segments:
+        if seg.status == "synthesized":
+            seg.status = "translated"
+    db.commit()
+
+    return {"message": "Voice mapping updated", "mapping": mapping}
+
+
+@app.get("/preview_tts")
+@app.get("/api/preview_tts")
+async def preview_tts(
+    text: str,
+    voice: str,
+    target_lang: str = "km",
+    voice_tone: str = "auto",
+    translation_style: str = "cinematic"
+):
+    # Determine TTS backend
+    tts_backend = os.getenv("TTS_BACKEND", "voxcpm2").strip().lower()
+    
+    # Create a temporary file path
+    temp_dir = os.path.join(DATA_DIR, "temp_previews")
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # Self-clean old preview files (> 5 minutes)
+    import time
+    now = time.time()
+    for f in os.listdir(temp_dir):
+        fp = os.path.join(temp_dir, f)
+        if os.path.isfile(fp) and now - os.path.getmtime(fp) > 300:
+            try:
+                os.remove(fp)
+            except Exception:
+                pass
+                
+    temp_filename = f"preview_{uuid.uuid4().hex}.wav"
+    output_wav = os.path.join(temp_dir, temp_filename)
+    
+    try:
+        # Determine voice config
+        effective_voice_type = voice
+        
+        if tts_backend == "voxcpm2":
+            import sys
+            sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+            import voxcpm2
+            profile = "female"
+            if effective_voice_type in ("male", "elder_male"):
+                profile = "male"
+            elif effective_voice_type == "kid":
+                profile = "kid"
+                
+            voxcpm2.generate(
+                text=text,
+                output_path=output_wav,
+                voice_profile=profile,
+                target_lang=target_lang
+            )
+        else:
+            # Edge-TTS
+            voice_profiles = {
+                "male": {"voice": "km-KH-PisethNeural", "rate": "+0%", "pitch": "+0Hz"},
+                "female": {"voice": "km-KH-SreymomNeural", "rate": "+0%", "pitch": "+0Hz"},
+                "kid": {"voice": "km-KH-SreymomNeural", "rate": "+5%", "pitch": "+6Hz"},
+                "elder_male": {"voice": "km-KH-PisethNeural", "rate": "-2%", "pitch": "-4Hz"},
+                "elder_female": {"voice": "km-KH-SreymomNeural", "rate": "-2%", "pitch": "-2Hz"},
+            }
+            voice_config = voice_profiles.get(effective_voice_type, voice_profiles["female"])
+            
+            import subprocess
+            edge_cmd = [
+                "edge-tts",
+                "--voice", voice_config["voice"],
+                "--rate", voice_config["rate"],
+                "--pitch", voice_config["pitch"],
+                "--text", text,
+                "--write-media", output_wav
+            ]
+            subprocess.run(edge_cmd, capture_output=True)
+            
+        if os.path.exists(output_wav) and os.path.getsize(output_wav) > 0:
+            return FileResponse(output_wav, media_type="audio/wav")
+        else:
+            raise HTTPException(status_code=500, detail="Failed to generate TTS preview")
+    except Exception as e:
+        print(f"[Preview TTS Error] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/projects/{project_id}/segments/export-prompts")
+async def export_translation_prompts(
+    project_id: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Returns all segments that need manual translation with pre-built AI prompts.
+    """
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    segments = db.query(models.Segment).filter(
+        models.Segment.project_id == project_id,
+        models.Segment.status == "needs_manual_translation"
+    ).order_by(models.Segment.segment_index).all()
+
+    project_dir = os.path.join(DATA_DIR, project_id)
+    prompts_file_path = os.path.join(project_dir, "manual_prompts.txt")
+    manual_prompts_file = os.path.abspath(prompts_file_path) if os.path.exists(prompts_file_path) else None
+
+    return {
+        "project_id": project_id,
+        "total_segments_needing_translation": len(segments),
+        "manual_prompts_file": manual_prompts_file,
+        "segments": [
+            {
+                "segment_id": s.id,
+                "segment_index": s.segment_index,
+                "speaker_id": s.speaker_id,
+                "start_time": s.start_time,
+                "end_time": s.end_time,
+                "original_text": s.original_text,
+                "ai_prompt": s.ai_prompt
+            } for s in segments
+        ]
+    }
+
+@app.get("/api/downloads/{project_id}/video/{format}")
+async def download_video(project_id: str, format: str, db: Session = Depends(get_db)):
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_dir = os.path.join(DATA_DIR, project_id)
+    file_path = None
+
+    if format == "original":
+        file_path = os.path.join(project_dir, "source_video.mp4")
+    elif format == "16_9":
+        file_path = os.path.join(project_dir, "output_16_9.mp4")
+    elif format == "9_16":
+        file_path = os.path.join(project_dir, "output_9_16.mp4")
+
+    if file_path and os.path.exists(file_path):
+        return FileResponse(file_path, media_type="video/mp4")
+    raise HTTPException(status_code=404, detail=f"Video format {format} not found")
+
+@app.get("/api/downloads/{project_id}/audio/{format}")
+async def download_audio(project_id: str, format: str, db: Session = Depends(get_db)):
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_dir = os.path.join(DATA_DIR, project_id)
+    
+    if format in ["mp3", "wav"]:
+        file_path = os.path.join(project_dir, "final_dubbed_audio.wav")
+        if os.path.exists(file_path):
+            return FileResponse(file_path, media_type="audio/wav")
+    
+    raise HTTPException(status_code=404, detail=f"Audio format {format} not found")
+
+@app.get("/api/downloads/{project_id}/subtitles/{format}")
+async def download_subtitles(project_id: str, format: str, db: Session = Depends(get_db)):
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_dir = os.path.join(DATA_DIR, project_id)
+    
+    if format == "srt":
+        file_path = os.path.join(project_dir, "subtitles_kh.srt")
+        if os.path.exists(file_path):
+            return FileResponse(file_path, media_type="text/plain")
+            
+    raise HTTPException(status_code=404, detail=f"Subtitles format {format} not found")
+
+@app.get("/api/downloads/{project_id}/thumbnail/{filename}")
+async def download_thumbnail(project_id: str, filename: str, db: Session = Depends(get_db)):
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_dir = os.path.join(DATA_DIR, project_id)
+    file_path = os.path.join(project_dir, "thumbnails", filename)
+    
+    if os.path.exists(file_path):
+        return FileResponse(file_path, media_type="image/jpeg")
+        
+    raise HTTPException(status_code=404, detail=f"Thumbnail {filename} not found")
+
 @app.post("/api/projects/{project_id}/cancel")
 async def cancel_project(project_id: str, db: Session = Depends(get_db)):
     project = db.query(models.Project).filter(models.Project.id == project_id).first()
@@ -323,183 +799,14 @@ async def delete_project(project_id: str, db: Session = Depends(get_db)):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     
-    # Delete folder from disk
-    project_dir = os.path.join(DATA_DIR, project_id)
-    if os.path.exists(project_dir):
-        try:
-            shutil.rmtree(project_dir)
-        except Exception as e:
-            print(f"[Backend] Error deleting project files: {e}")
-            
-    # Delete from database (cascades automatically to segments, chunks, thumbnails)
     db.delete(project)
     db.commit()
+    
+    project_dir = os.path.join(DATA_DIR, project_id)
+    if os.path.exists(project_dir):
+        shutil.rmtree(project_dir, ignore_errors=True)
+        
     return {"message": "Project deleted successfully", "project_id": project_id}
 
-
-@app.get("/api/downloads/{project_id}/video/{format_type}")
-async def download_video(project_id: str, format_type: str, db: Session = Depends(get_db)):
-    project = db.query(models.Project).filter(models.Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    file_path = None
-    if format_type == "16_9":
-        file_path = project.output_video_16_9
-    elif format_type == "9_16":
-        file_path = project.output_video_9_16
-    elif format_type == "original":
-        file_path = project.video_path
-
-    if not file_path or not os.path.exists(file_path):
-        raise HTTPException(status_code=400, detail="Requested file format not found or not rendered yet")
-
-    return FileResponse(file_path, filename=os.path.basename(file_path))
-
-
-def format_srt_time(seconds: float) -> str:
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int((seconds - int(seconds)) * 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
-
-
-@app.get("/api/downloads/{project_id}/subtitles/srt")
-async def download_srt(project_id: str, db: Session = Depends(get_db)):
-    project = db.query(models.Project).filter(models.Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    segments = db.query(models.Segment).filter(
-        models.Segment.project_id == project_id
-    ).order_by(models.Segment.start_time).all()
-
-    srt_content = ""
-    for idx, seg in enumerate(segments, 1):
-        start_str = format_srt_time(seg.start_time)
-        end_str = format_srt_time(seg.end_time)
-        text = seg.translated_text or ""
-        srt_content += f"{idx}\n{start_str} --> {end_str}\n{text}\n\n"
-
-    from fastapi.responses import Response
-    return Response(
-        content=srt_content,
-        media_type="application/x-subrip",
-        headers={"Content-Disposition": f"attachment; filename=subtitles_{project_id[:8]}.srt"}
-    )
-
-
-@app.get("/api/downloads/{project_id}/audio/mp3")
-async def download_audio_mp3(project_id: str, db: Session = Depends(get_db)):
-    project = db.query(models.Project).filter(models.Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    video_path = project.output_video_16_9
-    if not video_path or not os.path.exists(video_path):
-        raise HTTPException(status_code=400, detail="Dubbed video not found or not rendered yet")
-
-    # Extract audio to MP3 using ffmpeg
-    mp3_path = os.path.join(os.path.dirname(video_path), f"dubbed_{project_id[:8]}.mp3")
-    if not os.path.exists(mp3_path):
-        try:
-            import subprocess
-            import imageio_ffmpeg
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-            subprocess.run([
-                ffmpeg_exe, "-y", "-i", video_path, "-vn", "-acodec", "libmp3lame", "-aq", "2", mp3_path
-            ], check=True, capture_output=True)
-        except Exception as e:
-            print(f"[Backend] Error extracting MP3 audio: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to extract audio track: {e}")
-
-    return FileResponse(mp3_path, media_type="audio/mp3", filename=f"dubbed_audio_{project_id[:8]}.mp3")
-
-@app.get("/api/downloads/{project_id}/thumbnail/{filename}")
-async def download_thumbnail(project_id: str, filename: str):
-    project_dir = os.path.join(DATA_DIR, project_id)
-    file_path = os.path.join(project_dir, filename)
-
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Thumbnail not found")
-
-    return FileResponse(file_path)
-
-# WebSocket Endpoint
-@app.websocket("/ws/progress/{project_id}")
-async def websocket_progress(websocket: WebSocket, project_id: str):
-    await ws_manager.connect(project_id, websocket)
-    try:
-        while True:
-            try:
-                db = SessionLocal()
-                try:
-                    project = db.query(models.Project).filter(models.Project.id == project_id).first()
-                    if project:
-                        chunks = db.query(models.VideoChunk).filter(models.VideoChunk.project_id == project_id).all()
-                        total_chunks = len(chunks)
-                        completed_chunks = sum(1 for c in chunks if c.status == "completed")
-                        failed_chunks = sum(1 for c in chunks if c.status == "failed")
-
-                        segments = db.query(models.Segment).filter(models.Segment.project_id == project_id).all()
-                        total_segments = len(segments)
-                        completed_segments = sum(1 for s in segments if s.status == "synthesized")
-
-                        progress_percentage = 0
-                        if project.status == "completed":
-                            progress_percentage = 100
-                        elif project.status == "exporting":
-                            progress_percentage = 90
-                        elif project.status == "synthesizing":
-                            progress_percentage = 50 + int((completed_segments / max(1, total_segments)) * 40)
-                        elif project.status == "translating":
-                            progress_percentage = 40
-                        elif project.status == "transcribing":
-                            progress_percentage = 30
-                        elif project.status == "stemming":
-                            progress_percentage = 20
-                        elif project.status == "ingesting":
-                            progress_percentage = 10
-
-                        status_payload = {
-                            "project_id": project_id,
-                            "status": project.status,
-                            "progress": progress_percentage,
-                            "chunks": {
-                                "total": total_chunks,
-                                "completed": completed_chunks,
-                                "failed": failed_chunks
-                            },
-                            "segments": {
-                                "total": total_segments,
-                                "completed": completed_segments
-                            }
-                        }
-                        await websocket.send_json(status_payload)
-                except (WebSocketDisconnect, RuntimeError) as ws_err:
-                    raise ws_err
-                except Exception as e:
-                    print(f"[WebSocket] Query error: {e}")
-                finally:
-                    db.close()
-
-                await asyncio.sleep(1)
-            except (WebSocketDisconnect, asyncio.CancelledError):
-                print(f"[WebSocket] Progress session ended for project {project_id}")
-                break
-    except Exception as e:
-        print(f"[WebSocket] Exception: {e}")
-    finally:
-        ws_manager.disconnect(project_id, websocket)
-        if websocket.client_state != WebSocketState.DISCONNECTED:
-            try:
-                await websocket.close()
-            except Exception:
-                pass
-
-
 if frontend_dir:
-    print(f"[Backend] Serving frontend static files from: {frontend_dir}")
-    app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
-
+    app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="static")

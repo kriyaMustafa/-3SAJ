@@ -13,6 +13,11 @@ class Project(Base):
     source_language = Column(String, default="en")
     target_language = Column(String, default="km")
     genre_mode = Column(String, default="anime_recap")  # 'anime_recap' or 'drama_recap'
+    narrator_voice = Column(String, nullable=True, default="male")  # For anime_recap: single narrator voice ('male' or 'female')
+    enable_background_sound = Column(Boolean, default=True)
+    enable_noise_cleaning = Column(Boolean, default=True)
+    enable_subtitles = Column(Boolean, default=True)
+    tts_engine = Column(String, default="voxcpm2")  # 'voxcpm2' or 'google'
     generate_shorts = Column(Boolean, default=False)
     status = Column(String, default="pending")  # pending, ingesting, stemming, transcribing, translating, synthesizing, exporting, completed, failed
     video_path = Column(String, nullable=True)
@@ -53,9 +58,12 @@ class Segment(Base):
     start_time = Column(Float, nullable=False)  # Seconds from absolute start of video
     end_time = Column(Float, nullable=False)    # Seconds from absolute start of video
     original_text = Column(Text, nullable=False)
+    extended_duration = Column(Float, default=0.0)
     translated_text = Column(Text, nullable=True)
+    ai_prompt = Column(Text, nullable=True)  # Pre-built prompt for manual AI chat translation when API quota exceeded
+    detected_voice_type = Column(String, nullable=True)  # 'male', 'female', 'kid', 'elder_male', 'elder_female'
     audio_path = Column(String, nullable=True)
-    status = Column(String, default="pending")  # pending, translated, synthesized, failed
+    status = Column(String, default="pending")  # pending, translated, needs_manual_translation, synthesized, failed
     error_traceback = Column(Text, nullable=True)
 
     project = relationship("Project", back_populates="segments")

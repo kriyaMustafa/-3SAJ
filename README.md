@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Khmer AI Video Translator 🇰🇭 🤖
 
 Professional AI-powered video dubbing pipeline that translates any video into Khmer while preserving original background sounds and matching speaker genders.
@@ -90,7 +89,12 @@ To package the application into a standalone Windows program:
     ```
 3.  **Find your App:**
     The finished application will be in the `backend/dist/launcher/` folder. You can share this entire folder with anyone. They just need to run `launcher.exe`.
-=======
+
+---
 # project-x1
 translat video
->>>>>>> 1132aa195dc5b81277c15c34e017dfbabecac597
+1-use api key if api out quota system give give me transcrip with promt to use ai chat help translate and have btn for submit and make it as path have id every voice trantricp and the
+    are not to big to make show ai can help  can translat
+2- auto decet voice male femle and kid older 
+3- make the viove to clean not nois and use only one voice to one charater for the movei drama , nad for anime recap use only one voice male or female by choising 
+4-
