@@ -21,7 +21,7 @@ echo 3. Compiling to .exe...
 echo WARNING: This process might take 15-30 minutes for a heavy AI app.
 echo.
 
-pyinstaller --noconfirm --onedir --windowed --name "AIVideoTranslator" ^
+pyinstaller --noconfirm --onedir --console --name "AIVideoTranslator" ^
     --icon "app_icon.ico" ^
     --add-data "backend/dist;dist" ^
     --add-data "backend/.env;." ^
@@ -31,11 +31,7 @@ pyinstaller --noconfirm --onedir --windowed --name "AIVideoTranslator" ^
     --exclude-module "modelscope.trainers" ^
     --exclude-module "modelscope.msdatasets" ^
     --exclude-module "modelscope.trainers.hooks.swift" ^
-    --exclude-module "modelscope.pipelines" ^
     --exclude-module "modelscope.pipelines.cv" ^
-    --exclude-module "modelscope.pipelines.nlp" ^
-    --exclude-module "modelscope.pipelines.multi_modal" ^
-    --exclude-module "modelscope.pipelines.audio" ^
     --hidden-import "uvicorn.logging" ^
     --hidden-import "uvicorn.loops" ^
     --hidden-import "uvicorn.loops.auto" ^
@@ -49,6 +45,12 @@ pyinstaller --noconfirm --onedir --windowed --name "AIVideoTranslator" ^
     --hidden-import "sqlalchemy.sql.default_comparator" ^
     --hidden-import "faster_whisper" ^
     --hidden-import "pyannote.audio" ^
+    --hidden-import "celery.fixups" ^
+    --hidden-import "celery.fixups.django" ^
+    --hidden-import "celery.backends" ^
+    --hidden-import "celery.backends.redis" ^
+    --hidden-import "kombu.transport" ^
+    --hidden-import "kombu.transport.redis" ^
     "backend/launcher.py"
 
 echo.
