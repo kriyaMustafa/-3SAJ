@@ -21,7 +21,7 @@ echo 3. Compiling to .exe...
 echo WARNING: This process might take 15-30 minutes for a heavy AI app.
 echo.
 
-pyinstaller --noconfirm --onedir --console --name "AIVideoTranslator" ^
+pyinstaller --noconfirm --onedir --windowed --name "AIVideoTranslator" ^
     --icon "app_icon.ico" ^
     --add-data "backend/dist;dist" ^
     --add-data "backend/.env;." ^
@@ -49,6 +49,9 @@ pyinstaller --noconfirm --onedir --console --name "AIVideoTranslator" ^
     --hidden-import "celery.fixups.django" ^
     --hidden-import "celery.backends" ^
     --hidden-import "celery.backends.redis" ^
+    --hidden-import "celery.loaders" ^
+    --hidden-import "celery.loaders.app" ^
+    --hidden-import "celery.loaders.default" ^
     --hidden-import "kombu.transport" ^
     --hidden-import "kombu.transport.redis" ^
     "backend/launcher.py"

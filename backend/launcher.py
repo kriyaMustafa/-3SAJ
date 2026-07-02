@@ -44,10 +44,55 @@ if getattr(sys, 'frozen', False):
 
 from main import app
 
+def open_as_app(url):
+    import subprocess
+    import shutil
+    
+    # Paths to search for Chrome/Edge executable on Windows
+    paths = [
+        # Chrome paths
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+        # Edge paths
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    
+    # Check if chrome or msedge is available in PATH
+    for cmd in ["chrome", "msedge", "google-chrome", "microsoft-edge"]:
+        path = shutil.which(cmd)
+        if path:
+            paths.insert(0, path)
+            
+    # Try to launch the first browser found in app mode
+    for p in paths:
+        if os.path.exists(p):
+            try:
+                subprocess.Popen([p, f"--app={url}"])
+                print(f"🚀 Launched standalone app window using: {p}")
+                return True
+            except Exception:
+                pass
+                
+    return False
+
 def open_browser():
-    # Wait 2 seconds for the server to start before opening the browser
-    time.sleep(2)
-    webbrowser.open("http://127.0.0.1:8000/app")
+    # Wait 2.5 seconds for the server to start before opening
+    time.sleep(2.5)
+    url = "http://127.0.0.1:8000/"
+    
+    # Try launching as a chromeless standalone app window
+    launched = False
+    try:
+        launched = open_as_app(url)
+    except Exception as e:
+        print(f"Error launching app window: {e}")
+        
+    # Fallback to standard web browser tab if app mode launch fails
+    if not launched:
+        print("⚠️ Standalone app window launch failed. Falling back to default web browser.")
+        webbrowser.open(url)
 
 if __name__ == "__main__":
     threading.Thread(target=open_browser, daemon=True).start()
