@@ -34,7 +34,7 @@ MALE_KHMER_VOICE = os.getenv("MALE_KHMER_VOICE", "km-KH-PisethNeural")
 FEMALE_KHMER_VOICE = os.getenv("FEMALE_KHMER_VOICE", "km-KH-SreymomNeural")
 BACKGROUND_MODE = os.getenv("BACKGROUND_MODE", "demucs")
 TTS_CONCURRENCY = int(os.getenv("TTS_CONCURRENCY", "4"))
-MIN_TTS_TEMPO = float(os.getenv("MIN_TTS_TEMPO", "0.92"))
+MIN_TTS_TEMPO = float(os.getenv("MIN_TTS_TEMPO", "1.0"))
 MAX_TTS_TEMPO = float(os.getenv("MAX_TTS_TEMPO", "1.65"))
 BACKGROUND_NORMAL_VOLUME = float(os.getenv("BACKGROUND_NORMAL_VOLUME", "1.0"))
 BACKGROUND_DUCKED_VOLUME = float(os.getenv("BACKGROUND_DUCKED_VOLUME", "0.38"))
@@ -356,7 +356,7 @@ async def translate_transcript(transcript: list[dict[str, Any]]) -> list[str]:
     try:
         texts_to_translate = [seg["text"] for seg in transcript]
         prompt = (
-            "Translate the following list of English speech segments into natural Khmer. "
+            "Translate the following list of English speech segments into natural Khmer. for anime recap "
             "Maintain the context and flow of the conversation. "
             "Return the translations as a JSON array of strings in the exact same order and length as the input. "
             "Do not add any explanations, markdown formatting blocks, or other text outside the JSON array.\n\n"
@@ -463,6 +463,42 @@ def _estimate_gender(audio_segment: np.ndarray, sr: int) -> str:
         return "male"
 
 
+class MergedSegment:
+    def __init__(self, start, end, text):
+        self.start = start
+        self.end = end
+        self.text = text
+
+def merge_whisper_segments(segments, min_duration=10.0, max_duration=20.0):
+    merged_list = []
+    if not segments:
+        return merged_list
+
+    current_seg = None
+    for seg in segments:
+        if current_seg is None:
+            current_seg = MergedSegment(seg.start, seg.end, seg.text.strip())
+        else:
+            current_duration = current_seg.end - current_seg.start
+            added_duration = seg.end - current_seg.start
+            
+            # Merge if the current duration is less than min_duration,
+            # OR if adding this segment does not exceed max_duration
+            if current_duration < min_duration or added_duration <= max_duration:
+                current_seg.end = seg.end
+                if current_seg.text and not current_seg.text.endswith(" ") and not seg.text.startswith(" "):
+                    current_seg.text += " "
+                current_seg.text += seg.text.strip()
+            else:
+                merged_list.append(current_seg)
+                current_seg = MergedSegment(seg.start, seg.end, seg.text.strip())
+                
+    if current_seg:
+        merged_list.append(current_seg)
+        
+    return merged_list
+
+
 def transcribe_video(video_path: Path) -> list[dict[str, Any]]:
     global whisper_model, whisper_runtime
     model = _get_whisper_model()
@@ -502,6 +538,11 @@ def transcribe_video(video_path: Path) -> list[dict[str, Any]]:
                 os.environ.pop("WHISPER_DEVICE", None)
             else:
                 os.environ["WHISPER_DEVICE"] = previous_device
+
+    # Merge segments into 10s - 20s windows to prevent short fragmented lines
+    min_dur = float(os.getenv("MIN_SEGMENT_DURATION", "10.0"))
+    max_dur = float(os.getenv("MAX_SEGMENT_DURATION", "20.0"))
+    segments = merge_whisper_segments(list(segments), min_duration=min_dur, max_duration=max_dur)
 
     transcript: list[dict[str, Any]] = []
     

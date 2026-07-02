@@ -44,3 +44,7 @@ data/
 .env
 .env.*
 backend/.env
+
+# Root PyInstaller build directories
+build/
+dist/

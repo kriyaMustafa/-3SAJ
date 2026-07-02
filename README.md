@@ -97,4 +97,9 @@ translat video
     are not to big to make show ai can help  can translat
 2- auto decet voice male femle and kid older 
 3- make the viove to clean not nois and use only one voice to one charater for the movei drama , nad for anime recap use only one voice male or female by choising 
-4-
+  ### What to do now:
+
+  1. Re-build the frontend assets (run  npm run build  in  frontend/  directory).
+  2. Run  build_exe.bat  to compile the app using PyInstaller.
+  3. Once compiled, place your  VoxCPM2_Model  folder directly next to  AIVideoTranslator.exe  inside the  dist/AIVideoTranslator/  folder.
+  4. Double-click the  .exe  to test. It will load completely offline, run at high speed, and maintain character voices perfectly!

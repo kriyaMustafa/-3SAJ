@@ -29,6 +29,15 @@ if os.name == 'nt':
     except Exception as dll_err:
         print(f"[DLL Isolation Warning] Failed to configure isolated DLL paths: {dll_err}")
 
+CUDA_AVAILABLE = False
+try:
+    import torch
+    CUDA_AVAILABLE = torch.cuda.is_available()
+except Exception:
+    pass
+
+_video_duration_cache = {}
+
 
 
 from pathlib import Path
@@ -60,6 +69,65 @@ from tasks import task_ingest_and_scraping, task_synthesize_tts_segment, dispatc
 
 # Initialize FastAPI app
 app = FastAPI(title="AI Video Translation Dashboard API")
+
+@app.on_event("startup")
+async def startup_event():
+    print("[Startup Recovery] Running recovery checks...")
+    import threading
+    
+    def recover_tasks():
+        db = SessionLocal()
+        try:
+            active_projects = db.query(models.Project).filter(
+                models.Project.status.in_(["ingesting", "stemming", "translating", "synthesizing", "exporting"])
+            ).all()
+            
+            for project in active_projects:
+                print(f"[Startup Recovery] Found interrupted project: {project.id} ({project.name}) with status '{project.status}'")
+                if project.status == "ingesting":
+                    print(f"[Startup Recovery] Re-dispatching ingestion task...")
+                    from tasks import task_ingest_and_scraping
+                    dispatch_task(task_ingest_and_scraping, project.id)
+                elif project.status == "stemming":
+                    print(f"[Startup Recovery] Re-dispatching demucs separation task...")
+                    from tasks import task_demucs_separation
+                    audio_path = os.path.join(DATA_DIR, project.id, "source_audio.wav")
+                    if os.path.exists(audio_path):
+                        dispatch_task(task_demucs_separation, project.id, audio_path)
+                    else:
+                        print(f"[Startup Recovery] Warning: source_audio.wav not found at {audio_path}, retrying ingestion instead...")
+                        project.status = "ingesting"
+                        db.commit()
+                        from tasks import task_ingest_and_scraping
+                        dispatch_task(task_ingest_and_scraping, project.id)
+                elif project.status == "synthesizing":
+                    # Re-dispatch synthesis tasks for segments in "translated" status
+                    segments = db.query(models.Segment).filter(
+                        models.Segment.project_id == project.id,
+                        models.Segment.status == "translated"
+                    ).all()
+                    if segments:
+                        print(f"[Startup Recovery] Re-dispatching synthesis for {len(segments)} translated segments...")
+                        from tasks import task_synthesize_tts_segment
+                        for s in segments:
+                            dispatch_task(task_synthesize_tts_segment, project.id, s.id)
+                    else:
+                        from tasks import check_and_trigger_export
+                        check_and_trigger_export(db, project.id)
+                elif project.status == "translating":
+                    print(f"[Startup Recovery] Re-dispatching translation task...")
+                    from tasks import task_translate_segments
+                    dispatch_task(task_translate_segments, project.id)
+                elif project.status == "exporting":
+                    print(f"[Startup Recovery] Re-dispatching export task...")
+                    from tasks import task_composite_and_export
+                    dispatch_task(task_composite_and_export, project.id)
+        except Exception as startup_err:
+            print(f"[Startup Recovery] Error during recovery process: {startup_err}")
+        finally:
+            db.close()
+
+    threading.Thread(target=recover_tasks, daemon=True).start()
 
 # Configure CORS
 app.add_middleware(
@@ -248,7 +316,6 @@ async def get_project_details(project_id: str, db: Session = Depends(get_db)):
     chunks = db.query(models.VideoChunk).filter(models.VideoChunk.project_id == project_id).order_by(models.VideoChunk.chunk_index).all()
     segments = db.query(models.Segment).filter(models.Segment.project_id == project_id).order_by(models.Segment.segment_index).all()
     thumbnails = db.query(models.Thumbnail).filter(models.Thumbnail.project_id == project_id).order_by(models.Thumbnail.score.desc()).all()
-
     total_chunks = len(chunks)
     completed_chunks = sum(1 for c in chunks if c.status == "completed")
     total_segments = len(segments)
@@ -274,6 +341,112 @@ async def get_project_details(project_id: str, db: Session = Depends(get_db)):
     prompts_file_path = os.path.join(project_dir, "manual_prompts.txt")
     manual_prompts_file = os.path.abspath(prompts_file_path) if os.path.exists(prompts_file_path) else None
 
+    # Dynamic ETA and progress details computation
+    eta_str = None
+    detail_str = "Working..."
+
+    def format_eta(secs: float) -> str:
+        if secs <= 0:
+            return "0s"
+        secs = int(secs)
+        if secs < 60:
+            return f"{secs}s"
+        mins = secs // 60
+        s = secs % 60
+        if mins < 60:
+            return f"{mins}m {s}s"
+        hrs = mins // 60
+        m = mins % 60
+        return f"{hrs}h {m}m"
+
+    duration = 0.0
+    video_file = project.video_path or os.path.join(project_dir, "source_video.mp4")
+    if os.path.exists(video_file):
+        try:
+            mtime = os.path.getmtime(video_file)
+            if video_file in _video_duration_cache and _video_duration_cache[video_file][0] == mtime:
+                duration = _video_duration_cache[video_file][1]
+            else:
+                import subprocess
+                import json
+                cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_file]
+                res = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+                duration = float(json.loads(res.stdout)["format"]["duration"])
+                _video_duration_cache[video_file] = (mtime, duration)
+        except:
+            if segments:
+                duration = segments[-1].end_time
+    elif segments:
+        duration = segments[-1].end_time
+
+    import datetime
+    import math
+    now = datetime.datetime.utcnow()
+    elapsed_since_update = (now - project.updated_at).total_seconds()
+
+    if project.status == "ingesting":
+        detail_str = "Downloading and importing media file..."
+        eta_seconds = max(10, 120 - elapsed_since_update)
+        eta_str = format_eta(eta_seconds)
+
+    elif project.status == "stemming":
+        if duration > 900:
+            total_stem_chunks = math.ceil(duration / 600)
+            import glob
+            completed_stem_chunks = len(glob.glob(os.path.join(project_dir, "vocals_chunk_*.wav")))
+            remaining_chunks = max(0, total_stem_chunks - completed_stem_chunks)
+            chunk_time = 40 if CUDA_AVAILABLE else 180
+            eta_seconds = remaining_chunks * chunk_time
+            detail_str = f"Separating vocals and music: Chunk {completed_stem_chunks}/{total_stem_chunks} completed."
+        else:
+            eta_seconds = max(10, 60 - elapsed_since_update)
+            detail_str = "Separating vocals and background music..."
+        eta_str = format_eta(eta_seconds)
+
+    elif project.status == "transcribing":
+        detail_str = "Running Whisper AI speech-to-text transcription..."
+        total_tx_time = duration / 15
+        eta_seconds = max(10, total_tx_time - elapsed_since_update)
+        eta_str = format_eta(eta_seconds)
+
+    elif project.status == "translating":
+        detail_str = "Translating transcript into spoken Khmer..."
+        eta_seconds = max(10, 45 - elapsed_since_update)
+        eta_str = format_eta(eta_seconds)
+
+    elif project.status == "synthesizing":
+        completed_segs = completed_segments
+        total_segs = total_segments
+        remaining_segs = max(0, total_segs - completed_segs)
+        
+        # Estimate based on TTS engine and redis running state
+        tts_engine = getattr(project, "tts_engine", "voxcpm2")
+        if tts_engine == "voxcpm2":
+            from tasks import is_redis_running
+            if is_redis_running():
+                # In Celery worker mode, model stays in memory, takes ~1.5s per segment
+                eta_seconds = remaining_segs * 1.5
+            else:
+                # In optimized local in-process mode, model stays loaded, takes ~12.0s per segment
+                eta_seconds = remaining_segs * 12.0
+        else:
+            # Edge cloud TTS is very fast
+            eta_seconds = remaining_segs * 0.5
+            
+        detail_str = f"Generating dubbed Khmer voices: {completed_segs}/{total_segs} segments synthesized."
+        eta_str = format_eta(eta_seconds)
+
+    elif project.status == "exporting":
+        speed_factor = 9.5 if CUDA_AVAILABLE else 4.5
+        total_export_time = duration / speed_factor
+        eta_seconds = max(10, total_export_time - elapsed_since_update)
+        detail_str = "Encoding final video stream using GPU acceleration..." if CUDA_AVAILABLE else "Encoding final video stream on CPU..."
+        eta_str = format_eta(eta_seconds)
+
+    elif project.status == "completed":
+        detail_str = "Finished! Your translated video is ready for download."
+        eta_str = "0s"
+
     return {
         "project": {
             "id": project.id,
@@ -292,6 +465,8 @@ async def get_project_details(project_id: str, db: Session = Depends(get_db)):
             "manual_prompts_file": manual_prompts_file,
             "status": project.status,
             "progress": progress_percentage,
+            "eta": eta_str,
+            "detail": detail_str,
             "output_video_16_9": project.output_video_16_9,
             "output_video_9_16": project.output_video_9_16,
             "created_at": project.created_at.isoformat(),
@@ -457,11 +632,11 @@ async def batch_translate_segments(
         segment.translated_text = translated_text
         segment.status = "translated"
         segment.ai_prompt = None  # Clear the prompt since translation is now provided
-        db.commit()
-
         success_count += 1
 
     if success_count > 0:
+        db.commit()
+        
         # Check if ALL segments in the project are translated
         all_segments = db.query(models.Segment).filter(models.Segment.project_id == project_id).all()
         all_translated = all(s.translated_text for s in all_segments)
@@ -792,6 +967,31 @@ async def cancel_project(project_id: str, db: Session = Depends(get_db)):
     project.status = "cancelled"
     db.commit()
     return {"message": "Project cancellation requested", "project_id": project_id}
+
+@app.post("/api/projects/{project_id}/retry")
+async def retry_project(project_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # Reset status
+    project.status = "pending"
+    db.commit()
+    
+    from tasks import task_demucs_separation
+    
+    project_dir = os.path.join(DATA_DIR, project_id)
+    audio_path = os.path.join(project_dir, "source_audio.wav")
+    
+    if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+        print(f"[API] Retrying project {project_id} from stemming stage (source_audio.wav exists)")
+        dispatch_task(task_demucs_separation, project_id, audio_path, background_tasks=background_tasks)
+    else:
+        print(f"[API] Retrying project {project_id} from ingestion stage")
+        dispatch_task(task_ingest_and_scraping, project_id, background_tasks=background_tasks)
+        
+    return {"message": "Project pipeline retried", "project_id": project_id}
+
 
 @app.delete("/api/projects/{project_id}")
 async def delete_project(project_id: str, db: Session = Depends(get_db)):

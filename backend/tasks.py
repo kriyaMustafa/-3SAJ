@@ -45,6 +45,227 @@ import traceback
 import subprocess
 from datetime import datetime, timedelta
 from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
+
+# Create specific thread pools based on the engine's compute limits
+gpu_executor = ThreadPoolExecutor(max_workers=1)     # For local GPU tasks (VoxCPM2, Demucs, Whisper)
+cloud_executor = ThreadPoolExecutor(max_workers=32)  # For network/I/O bound tasks (Edge Cloud, Translate, etc.)
+
+DATA_DIR = "/app/data" if os.path.exists("/app") else "./data"
+os.makedirs(DATA_DIR, exist_ok=True)
+PENDING_TASKS_FILE = os.path.abspath(os.path.join(DATA_DIR, "pending_local_tasks.json"))
+
+def write_subprocess_task(task_name, args, kwargs):
+    tasks = []
+    if os.path.exists(PENDING_TASKS_FILE):
+        try:
+            with open(PENDING_TASKS_FILE, "r", encoding="utf-8") as f:
+                tasks = json.load(f)
+        except Exception:
+            tasks = []
+    
+    tasks.append({
+        "task_name": task_name,
+        "args": list(args),
+        "kwargs": kwargs
+    })
+    
+    try:
+        with open(PENDING_TASKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(tasks, f, indent=2)
+    except Exception as e:
+        print(f"[Queue Subprocess] Error writing pending task to file: {e}")
+
+import queue
+import json
+import threading
+
+_task_queue = queue.Queue()
+
+import atexit
+_persistent_worker = None
+_persistent_worker_lock = threading.Lock()
+
+def cleanup_persistent_worker():
+    global _persistent_worker
+    if _persistent_worker is not None and _persistent_worker.poll() is None:
+        print("[Queue Worker] Terminating persistent task worker subprocess...")
+        try:
+            _persistent_worker.terminate()
+            _persistent_worker.wait(timeout=2)
+        except Exception:
+            try:
+                _persistent_worker.kill()
+            except Exception:
+                pass
+
+atexit.register(cleanup_persistent_worker)
+
+def get_persistent_worker():
+    global _persistent_worker
+    with _persistent_worker_lock:
+        if _persistent_worker is None or _persistent_worker.poll() is not None:
+            print("[Queue Worker] Starting/Restarting persistent task worker subprocess...")
+            env = os.environ.copy()
+            env["IS_TASK_SUBPROCESS"] = "1"
+            script_path = os.path.abspath(__file__)
+            _persistent_worker = subprocess.Popen(
+                [sys.executable, script_path, "--persistent-worker"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=sys.stderr,
+                text=True,
+                bufsize=1,
+                env=env
+            )
+        return _persistent_worker
+
+def _subprocess_queue_worker():
+    while True:
+        item = _task_queue.get()
+        if item is None:
+            break
+        task_name, args, kwargs = item
+        try:
+            # OPTIMIZATION: Run TTS synthesis tasks in-process to keep the model loaded in GPU memory,
+            # bypassing the massive 30-40s process startup and weights unpickling overhead on Windows.
+            # CRITICAL Windows fix: VoxCPM2 CUDA model loading inside Uvicorn's process triggers native
+            # crashes. We only run TTS in-process if using non-VoxCPM2 backends (e.g. Edge Cloud).
+            is_voxcpm2 = False
+            if task_name in ("task_synthesize_tts_segment", "task_re_render_segment"):
+                try:
+                    project_id = args[0]
+                    db = SessionLocal()
+                    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+                    if project:
+                        tts_backend = getattr(project, "tts_engine", "voxcpm2").strip().lower()
+                        if tts_backend == "voxcpm2":
+                            is_voxcpm2 = True
+                    db.close()
+                except Exception:
+                    pass
+
+            if task_name in ("task_synthesize_tts_segment", "task_re_render_segment") and not is_voxcpm2:
+                print(f"[Queue Worker] Optimization: Executing non-VoxCPM2 task {task_name} in-process...")
+                func = globals().get(task_name)
+                if func:
+                    func(*args, **kwargs)
+                    print(f"[Queue Worker] Task {task_name} completed successfully in-process.")
+                else:
+                    print(f"[Queue Worker Error] Task {task_name} not found in globals!")
+                continue
+
+            env = os.environ.copy()
+            env["IS_TASK_SUBPROCESS"] = "1"
+            script_path = os.path.abspath(__file__)
+
+            # Clear any pre-existing pending tasks file before running
+            if os.path.exists(PENDING_TASKS_FILE):
+                try:
+                    os.remove(PENDING_TASKS_FILE)
+                except Exception:
+                    pass
+
+            if task_name in ("task_synthesize_tts_segment", "task_re_render_segment") and is_voxcpm2:
+                print(f"[Queue Worker] Executing task {task_name} in persistent worker subprocess...")
+                worker = get_persistent_worker()
+                payload = {"task_name": task_name, "args": list(args), "kwargs": kwargs}
+                
+                success = False
+                try:
+                    # Write task payload
+                    worker.stdin.write(json.dumps(payload) + "\n")
+                    worker.stdin.flush()
+                    
+                    # Read response (robust JSON-line parsing to skip any startup prints or warnings)
+                    response = None
+                    while True:
+                        response_line = worker.stdout.readline()
+                        if not response_line:
+                            raise RuntimeError("Persistent worker subprocess died or closed stdout unexpectedly.")
+                        
+                        line_str = response_line.strip()
+                        if not line_str:
+                            continue
+                        
+                        try:
+                            parsed = json.loads(line_str)
+                            if isinstance(parsed, dict) and "status" in parsed:
+                                response = parsed
+                                break
+                        except json.JSONDecodeError:
+                            # Forward non-JSON output (like startup/isolation messages) to stderr
+                            print(f"[Persistent Worker Startup/Log] {line_str}", file=sys.stderr)
+                    
+                    if response and response.get("status") == "success":
+                        print(f"[Queue Worker] Task {task_name} completed successfully in persistent worker.")
+                        success = True
+                    else:
+                        err_msg = response.get("error") if response else "Unknown error"
+                        print(f"[Queue Worker] Task {task_name} failed in persistent worker: {err_msg}")
+                except Exception as worker_exc:
+                    print(f"[Queue Worker Error] Failed executing in persistent worker: {worker_exc}")
+                    # Try to terminate/kill the crashed worker so it gets restarted next time
+                    cleanup_persistent_worker()
+                    _persistent_worker = None
+                    # Fallback to isolated subprocess for safety
+                    print(f"[Queue Worker] Falling back to isolated subprocess for task {task_name}...")
+                    
+                    serialized_payload = json.dumps({"args": list(args), "kwargs": kwargs})
+                    proc = subprocess.run(
+                        [sys.executable, script_path, task_name, serialized_payload],
+                        env=env
+                    )
+                    success = (proc.returncode == 0)
+            else:
+                print(f"[Queue Worker] Executing task {task_name} in isolated subprocess...")
+                payload = {
+                    "args": list(args),
+                    "kwargs": kwargs
+                }
+                serialized_payload = json.dumps(payload)
+                
+                # Inherit system output/error directly to print to parent console
+                proc = subprocess.run(
+                    [sys.executable, script_path, task_name, serialized_payload],
+                    env=env
+                )
+                if proc.returncode != 0:
+                    print(f"[Queue Worker] Task {task_name} failed in isolated subprocess with return code {proc.returncode}")
+                else:
+                    print(f"[Queue Worker] Task {task_name} completed successfully in isolated subprocess.")
+            
+            # Read and enqueue any tasks spawned by the subprocess
+            if os.path.exists(PENDING_TASKS_FILE):
+                try:
+                    with open(PENDING_TASKS_FILE, "r", encoding="utf-8") as f:
+                        spawned_tasks = json.load(f)
+                    try:
+                        os.remove(PENDING_TASKS_FILE)
+                    except Exception:
+                        pass
+                    
+                    for t in spawned_tasks:
+                        t_name = t["task_name"]
+                        t_args = t["args"]
+                        t_kwargs = t["kwargs"]
+                        print(f"[Queue Worker] Enqueuing spawned task {t_name} to main queue...")
+                        _task_queue.put((t_name, t_args, t_kwargs))
+                except Exception as read_err:
+                    print(f"[Queue Worker] Error processing spawned tasks: {read_err}")
+        except Exception as queue_err:
+            print(f"[Queue Worker Exception] Error executing task {task_name}: {queue_err}")
+            traceback.print_exc()
+        finally:
+            _task_queue.task_done()
+
+# Start background worker only if not running as a task subprocess itself
+if not os.getenv("IS_TASK_SUBPROCESS"):
+    _worker_thread = Thread(target=_subprocess_queue_worker, daemon=True)
+    _worker_thread.start()
+
+
+
 import socket
 
 from celery import Celery
@@ -91,12 +312,13 @@ def dispatch_task(task, *args, background_tasks=None, **kwargs):
         print(f"[Celery] Dispatching {task.__name__} via Celery...")
         task.delay(*args, **kwargs)
     else:
-        print(f"[Thread Fallback] Redis offline. Dispatching {task.__name__} in background thread...")
-        if background_tasks:
-            background_tasks.add_task(task, *args, **kwargs)
+        task_name = task.__name__
+        if os.getenv("IS_TASK_SUBPROCESS") == "1":
+            print(f"[Queue Subprocess] Subprocess enqueuing task {task_name} via shared file...")
+            write_subprocess_task(task_name, args, kwargs)
         else:
-            t = Thread(target=task, args=args, kwargs=kwargs)
-            t.start()
+            print(f"[Queue Local] Enqueuing task {task_name} in local subprocess queue...")
+            _task_queue.put((task_name, args, kwargs))
 
 
 def check_and_trigger_export(db, project_id):
@@ -141,8 +363,7 @@ app.conf.update(
     }
 )
 
-DATA_DIR = "/app/data" if os.path.exists("/app") else "./data"
-os.makedirs(DATA_DIR, exist_ok=True)
+
 
 def run_command_with_timeout(cmd, timeout=300, capture_output=False, project_id=None, db=None, **kwargs):
     """
@@ -157,6 +378,8 @@ def run_command_with_timeout(cmd, timeout=300, capture_output=False, project_id=
     if capture_output:
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
+    if "stdin" not in kwargs:
+        kwargs["stdin"] = subprocess.DEVNULL
         
     proc = None
     try:
@@ -523,71 +746,309 @@ def task_demucs_separation(project_id: str, audio_path: str):
         venv_python = os.path.abspath(
             os.path.join(os.path.dirname(sys.executable), "python.exe")
         ) if os.name == "nt" else sys.executable
-        print(f"[Queue 1] Starting Demucs separation on: {abs_audio_path} (device={demucs_device})")
-        print(f"[Queue 1] Using Python: {venv_python}")
-        demucs_cmd = [
-            venv_python, "-m", "demucs",
-            "--two-stems", "vocals",
-            "--device", demucs_device,
-            "-o", abs_demucs_out_dir,
-            abs_audio_path
-        ]
-        # Build a clean environment: inherit current env but block user site-packages
-        demucs_env = os.environ.copy()
-        demucs_env["PYTHONNOUSERSITE"] = "1"
-        demucs_env.pop("PYTHONPATH", None)  # clear any conflicting PYTHONPATH
-        # Run Demucs — on Windows demucs writes progress to stderr which may cause
-        # non-zero exit codes. We tolerate the exit code and check output files instead.
-        try:
-            demucs_result = subprocess.run(
-                demucs_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=300,
-                env=demucs_env
-            )
-            stdout_txt = demucs_result.stdout.decode("utf-8", errors="replace")
-            stderr_txt = demucs_result.stderr.decode("utf-8", errors="replace")
-            print(f"[Queue 1] Demucs exit code: {demucs_result.returncode}")
-            if stderr_txt.strip():
-                # Print full stderr so we can see any errors after the progress bars
-                print(f"[Queue 1] Demucs stderr:\n{stderr_txt}")
-        except subprocess.TimeoutExpired as timeout_err:
-            print("[Queue 1] Pipeline stage timed out during execution. Demucs separation timed out.")
-            project.status = "failed"
-            db.commit()
-            raise Exception("Pipeline stage timed out during execution.") from timeout_err
-
-        # Retrieve isolated vocals and background music.
-        # Demucs may flush output files slightly after subprocess exits (especially under
-        # I/O load from concurrent video download/chunking), so poll up to 30 seconds.
-        vocal_src = None
-        bgm_src = None
-        for _attempt in range(30):
-            for root, dirs, files in os.walk(demucs_out_dir):
-                for file in files:
-                    if file == "vocals.wav":
-                        fpath = os.path.join(root, file)
-                        if os.path.getsize(fpath) > 0:
-                            vocal_src = fpath
-                    elif file in ("no_vocals.wav", "accompaniment.wav", "background.wav"):
-                        fpath = os.path.join(root, file)
-                        if os.path.getsize(fpath) > 0:
-                            bgm_src = fpath
-            if vocal_src and bgm_src:
-                print(f"[Queue 1] Demucs output files ready after {_attempt}s.")
-                break
-            print(f"[Queue 1] Waiting for demucs output files... attempt {_attempt+1}/30")
-            time.sleep(1)
-
-        if not vocal_src or not bgm_src:
-            raise FileNotFoundError("Demucs failed to produce vocals or background audio files.")
 
         vocals_dest = os.path.join(project_dir, "vocals.wav")
         bgm_dest = os.path.join(project_dir, "bgm.wav")
 
-        shutil.move(vocal_src, vocals_dest)
-        shutil.move(bgm_src, bgm_dest)
+        # Get audio duration using ffprobe
+        probe_cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            abs_audio_path
+        ]
+        duration = 0.0
+        try:
+            res = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            if res.returncode == 0:
+                duration = float(res.stdout.decode("utf-8").strip())
+        except Exception as e:
+            print(f"[Queue 1] Warning: Error querying audio duration: {e}")
+
+        # Choose chunked processing if duration is above 15 minutes
+        CHUNK_THRESHOLD = 900
+        CHUNK_SIZE = 600
+
+        if duration > CHUNK_THRESHOLD:
+            num_segments = math.ceil(duration / CHUNK_SIZE)
+            print(f"[Queue 1] Audio duration is {duration}s. Exceeds threshold {CHUNK_THRESHOLD}s. Running Demucs in {num_segments} chunks of {CHUNK_SIZE}s to prevent memory issues.")
+            
+            for j in range(num_segments):
+                if is_project_cancelled(project_id):
+                    print(f"[Queue 1] Project {project_id} cancelled during chunked Demucs processing. Aborting.")
+                    return
+                
+                start_t = j * CHUNK_SIZE
+                dur_t = min(CHUNK_SIZE, duration - start_t)
+                segment_path = os.path.join(project_dir, f"demucs_chunk_{j}.wav")
+                
+                print(f"[Queue 1] Extracting chunk {j+1}/{num_segments}: start={start_t}s, duration={dur_t}s")
+                split_cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(start_t),
+                    "-t", str(dur_t),
+                    "-i", abs_audio_path,
+                    "-acodec", "copy",
+                    segment_path
+                ]
+                subprocess.run(split_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                
+                # Run Demucs on this chunk
+                demucs_out_dir_j = os.path.join(project_dir, f"demucs_out_{j}")
+                os.makedirs(demucs_out_dir_j, exist_ok=True)
+                abs_audio_path_j = os.path.abspath(segment_path)
+                abs_demucs_out_dir_j = os.path.abspath(demucs_out_dir_j)
+                
+                demucs_cmd_j = [
+                    venv_python, "-m", "demucs",
+                    "--two-stems", "vocals",
+                    "--device", demucs_device,
+                    "-o", abs_demucs_out_dir_j,
+                    abs_audio_path_j
+                ]
+                
+                demucs_env = os.environ.copy()
+                demucs_env["PYTHONNOUSERSITE"] = "1"
+                demucs_env.pop("PYTHONPATH", None)
+                
+                print(f"[Queue 1] Running Demucs on chunk {j+1}/{num_segments} using device={demucs_device}")
+                try:
+                    demucs_result = subprocess.run(
+                        demucs_cmd_j,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env=demucs_env
+                    )
+                    stderr_txt = demucs_result.stderr.decode("utf-8", errors="replace")
+                    if demucs_result.returncode != 0 and stderr_txt.strip():
+                        print(f"[Queue 1] Demucs chunk {j} stderr: {stderr_txt}")
+                except Exception as run_err:
+                    print(f"[Queue 1] Demucs chunk {j} execution failed: {run_err}")
+                
+                # Poll for outputs
+                vocal_src_j = None
+                bgm_src_j = None
+                for _attempt in range(30):
+                    for root, dirs, files in os.walk(demucs_out_dir_j):
+                        for file in files:
+                            if file == "vocals.wav":
+                                fpath = os.path.join(root, file)
+                                if os.path.getsize(fpath) > 0:
+                                    vocal_src_j = fpath
+                            elif file in ("no_vocals.wav", "accompaniment.wav", "background.wav"):
+                                fpath = os.path.join(root, file)
+                                if os.path.getsize(fpath) > 0:
+                                    bgm_src_j = fpath
+                    if vocal_src_j and bgm_src_j:
+                        break
+                    time.sleep(1)
+                
+                # CPU fallback for chunk
+                if (not vocal_src_j or not bgm_src_j) and demucs_device == "cuda":
+                    print(f"[Queue 1] WARNING: Demucs failed on CUDA for chunk {j}. Retrying on CPU...")
+                    demucs_cmd_cpu = list(demucs_cmd_j)
+                    try:
+                        device_idx = demucs_cmd_cpu.index("--device")
+                        demucs_cmd_cpu[device_idx + 1] = "cpu"
+                    except Exception:
+                        pass
+                    
+                    try:
+                        demucs_result = subprocess.run(
+                            demucs_cmd_cpu,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            env=demucs_env
+                        )
+                        vocal_src_j = None
+                        bgm_src_j = None
+                        for _attempt in range(30):
+                            for root, dirs, files in os.walk(demucs_out_dir_j):
+                                for file in files:
+                                    if file == "vocals.wav":
+                                        fpath = os.path.join(root, file)
+                                        if os.path.getsize(fpath) > 0:
+                                            vocal_src_j = fpath
+                                    elif file in ("no_vocals.wav", "accompaniment.wav", "background.wav"):
+                                        fpath = os.path.join(root, file)
+                                        if os.path.getsize(fpath) > 0:
+                                            bgm_src_j = fpath
+                            if vocal_src_j and bgm_src_j:
+                                break
+                            time.sleep(1)
+                    except Exception as cpu_err:
+                        print(f"[Queue 1] Demucs CPU retry failed for chunk {j}: {cpu_err}")
+                
+                if not vocal_src_j or not bgm_src_j:
+                    raise FileNotFoundError(f"Demucs failed to produce vocals or background audio files for chunk {j}.")
+                
+                # Move chunk outputs to fixed filenames
+                vocals_chunk_dest = os.path.join(project_dir, f"vocals_chunk_{j}.wav")
+                bgm_chunk_dest = os.path.join(project_dir, f"bgm_chunk_{j}.wav")
+                shutil.move(vocal_src_j, vocals_chunk_dest)
+                shutil.move(bgm_src_j, bgm_chunk_dest)
+                
+                # Clean up chunk inputs and temp dirs
+                try:
+                    os.remove(segment_path)
+                    shutil.rmtree(demucs_out_dir_j, ignore_errors=True)
+                except Exception as cleanup_err:
+                    print(f"[Queue 1] Warning: failed to clean up temp files for chunk {j}: {cleanup_err}")
+            
+            # Concatenate all chunks
+            print(f"[Queue 1] Concatenating vocal chunks...")
+            vocals_list_file = os.path.join(project_dir, "vocals_list.txt")
+            with open(vocals_list_file, "w", encoding="utf-8") as f:
+                for j in range(num_segments):
+                    f.write(f"file 'vocals_chunk_{j}.wav'\n")
+            
+            concat_vocals_cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", "vocals_list.txt",
+                "-c", "copy",
+                "vocals.wav"
+            ]
+            run_command_with_timeout(concat_vocals_cmd, timeout=300, project_id=project_id, db=db, cwd=project_dir)
+            
+            print(f"[Queue 1] Concatenating background music chunks...")
+            bgm_list_file = os.path.join(project_dir, "bgm_list.txt")
+            with open(bgm_list_file, "w", encoding="utf-8") as f:
+                for j in range(num_segments):
+                    f.write(f"file 'bgm_chunk_{j}.wav'\n")
+            
+            concat_bgm_cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", "bgm_list.txt",
+                "-c", "copy",
+                "bgm.wav"
+            ]
+            run_command_with_timeout(concat_bgm_cmd, timeout=300, project_id=project_id, db=db, cwd=project_dir)
+            
+            # Clean up chunks and text lists
+            for j in range(num_segments):
+                try:
+                    os.remove(os.path.join(project_dir, f"vocals_chunk_{j}.wav"))
+                    os.remove(os.path.join(project_dir, f"bgm_chunk_{j}.wav"))
+                except Exception:
+                    pass
+            try:
+                os.remove(vocals_list_file)
+                os.remove(bgm_list_file)
+            except Exception:
+                pass
+            try:
+                shutil.rmtree(demucs_out_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        else:
+            # Run Demucs normally
+            print(f"[Queue 1] Starting Demucs separation on: {abs_audio_path} (device={demucs_device})")
+            print(f"[Queue 1] Using Python: {venv_python}")
+            demucs_cmd = [
+                venv_python, "-m", "demucs",
+                "--two-stems", "vocals",
+                "--device", demucs_device,
+                "-o", abs_demucs_out_dir,
+                abs_audio_path
+            ]
+            # Build a clean environment: inherit current env but block user site-packages
+            demucs_env = os.environ.copy()
+            demucs_env["PYTHONNOUSERSITE"] = "1"
+            demucs_env.pop("PYTHONPATH", None)  # clear any conflicting PYTHONPATH
+            # Run Demucs — on Windows demucs writes progress to stderr which may cause
+            # non-zero exit codes. We tolerate the exit code and check output files instead.
+            try:
+                demucs_result = subprocess.run(
+                    demucs_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=demucs_env
+                )
+                stdout_txt = demucs_result.stdout.decode("utf-8", errors="replace")
+                stderr_txt = demucs_result.stderr.decode("utf-8", errors="replace")
+                print(f"[Queue 1] Demucs exit code: {demucs_result.returncode}")
+                if stderr_txt.strip():
+                    # Print full stderr so we can see any errors after the progress bars
+                    print(f"[Queue 1] Demucs stderr:\n{stderr_txt}")
+            except subprocess.TimeoutExpired as timeout_err:
+                print("[Queue 1] Pipeline stage timed out during execution. Demucs separation timed out.")
+                project.status = "failed"
+                db.commit()
+                raise Exception("Pipeline stage timed out during execution.") from timeout_err
+
+            # Retrieve isolated vocals and background music.
+            # Demucs may flush output files slightly after subprocess exits (especially under
+            # I/O load from concurrent video download/chunking), so poll up to 30 seconds.
+            vocal_src = None
+            bgm_src = None
+            for _attempt in range(30):
+                for root, dirs, files in os.walk(demucs_out_dir):
+                    for file in files:
+                        if file == "vocals.wav":
+                            fpath = os.path.join(root, file)
+                            if os.path.getsize(fpath) > 0:
+                                vocal_src = fpath
+                        elif file in ("no_vocals.wav", "accompaniment.wav", "background.wav"):
+                            fpath = os.path.join(root, file)
+                            if os.path.getsize(fpath) > 0:
+                                bgm_src = fpath
+                if vocal_src and bgm_src:
+                    print(f"[Queue 1] Demucs output files ready after {_attempt}s.")
+                    break
+                print(f"[Queue 1] Waiting for demucs output files... attempt {_attempt+1}/30")
+                time.sleep(1)
+
+            # CPU Fallback: If CUDA run failed (due to Out Of Memory on long files), retry on CPU
+            if (not vocal_src or not bgm_src) and demucs_device == "cuda":
+                print("[Queue 1] WARNING: Demucs failed on CUDA (likely Out of Memory). Retrying separation on CPU...")
+                demucs_cmd_cpu = list(demucs_cmd)
+                try:
+                    device_idx = demucs_cmd_cpu.index("--device")
+                    demucs_cmd_cpu[device_idx + 1] = "cpu"
+                except Exception:
+                    pass
+                
+                print(f"[Queue 1] Re-starting Demucs separation on CPU...")
+                try:
+                    demucs_result = subprocess.run(
+                        demucs_cmd_cpu,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env=demucs_env
+                    )
+                    print(f"[Queue 1] Demucs CPU retry exit code: {demucs_result.returncode}")
+                    # Re-poll for files
+                    vocal_src = None
+                    bgm_src = None
+                    for _attempt in range(30):
+                        for root, dirs, files in os.walk(demucs_out_dir):
+                            for file in files:
+                                if file == "vocals.wav":
+                                    fpath = os.path.join(root, file)
+                                    if os.path.getsize(fpath) > 0:
+                                        vocal_src = fpath
+                                elif file in ("no_vocals.wav", "accompaniment.wav", "background.wav"):
+                                    fpath = os.path.join(root, file)
+                                    if os.path.getsize(fpath) > 0:
+                                        bgm_src = fpath
+                        if vocal_src and bgm_src:
+                            print(f"[Queue 1] Demucs CPU output files ready after {_attempt}s.")
+                            break
+                        print(f"[Queue 1] Waiting for demucs CPU output files... attempt {_attempt+1}/30")
+                        time.sleep(1)
+                except Exception as cpu_err:
+                    print(f"[Queue 1] Demucs CPU retry failed: {cpu_err}")
+
+            if not vocal_src or not bgm_src:
+                raise FileNotFoundError("Demucs failed to produce vocals or background audio files.")
+
+            shutil.move(vocal_src, vocals_dest)
+            shutil.move(bgm_src, bgm_dest)
 
         # ── Noise Cleaning Step ──
         # Apply highpass, lowpass, and FFT-based denoising to cleaned vocals
@@ -635,6 +1096,41 @@ def task_demucs_separation(project_id: str, audio_path: str):
 # QUEUE 2: Transcription & Forced Alignment (GPU Worker - Cycle 2)
 # =====================================================================
 
+class MergedSegment:
+    def __init__(self, start, end, text):
+        self.start = start
+        self.end = end
+        self.text = text
+
+def merge_whisper_segments(segments, min_duration=10.0, max_duration=15.0):
+    merged_list = []
+    if not segments:
+        return merged_list
+
+    current_seg = None
+    for seg in segments:
+        if current_seg is None:
+            current_seg = MergedSegment(seg.start, seg.end, seg.text.strip())
+        else:
+            current_duration = current_seg.end - current_seg.start
+            added_duration = seg.end - current_seg.start
+            
+            # Merge if the current duration is less than min_duration,
+            # OR if adding this segment does not exceed max_duration
+            if current_duration < min_duration or added_duration <= max_duration:
+                current_seg.end = seg.end
+                if current_seg.text and not current_seg.text.endswith(" ") and not seg.text.startswith(" "):
+                    current_seg.text += " "
+                current_seg.text += seg.text.strip()
+            else:
+                merged_list.append(current_seg)
+                current_seg = MergedSegment(seg.start, seg.end, seg.text.strip())
+                
+    if current_seg:
+        merged_list.append(current_seg)
+        
+    return merged_list
+
 @app.task(name="tasks.task_whisper_transcription")
 def task_whisper_transcription(project_id: str, vocals_path: str):
     db = get_db()
@@ -676,10 +1172,13 @@ def task_whisper_transcription(project_id: str, vocals_path: str):
             raise FileNotFoundError(f"[Queue 2] vocals file not found: {vocals_path_abs}")
         print(f"[Queue 2] Running Whisper transcription on: {vocals_path_abs}")
         lang = project.source_language if project.source_language and project.source_language.lower() != "auto" else None
-        segments, info = model.transcribe(vocals_path_abs, beam_size=5, language=lang)
+        segments, info = model.transcribe(vocals_path_abs, beam_size=1, language=lang)
         
-        segment_list = list(segments)
-        print(f"[Queue 2] Transcribed {len(segment_list)} segments. Aligning times...")
+        # Merge segments into 10s - 20s windows to prevent short fragmented lines
+        min_dur = float(os.getenv("MIN_SEGMENT_DURATION", "10.0"))
+        max_dur = float(os.getenv("MAX_SEGMENT_DURATION", "15.0"))
+        segment_list = merge_whisper_segments(list(segments), min_duration=min_dur, max_duration=max_dur)
+        print(f"[Queue 2] Transcribed and merged into {len(segment_list)} segments. Aligning times...")
 
         # Load vocals audio for pitch analysis (voice gender/age detection)
         import numpy as np
@@ -715,6 +1214,11 @@ def task_whisper_transcription(project_id: str, vocals_path: str):
 
                 f0_estimates = []
                 hop = frame_size // 2
+                # Limit to analyzing at most 80 frames per segment to prevent massive CPU overhead
+                total_possible_frames = len(segment_audio) // hop
+                if total_possible_frames > 80:
+                    hop = max(1, len(segment_audio) // 80)
+
                 for frame_start in range(0, len(segment_audio) - frame_size, hop):
                     frame = segment_audio[frame_start:frame_start + frame_size]
                     # Remove DC offset
@@ -819,6 +1323,20 @@ def task_whisper_transcription(project_id: str, vocals_path: str):
 # QUEUE 3: Conditional Language Routing & Genre-Aware Translation
 # =====================================================================
 
+def translate_text_fallback(text: str, target_lang: str = "km") -> str:
+    try:
+        from deep_translator import GoogleTranslator
+        lang_map = {
+            "km": "km", "en": "en", "zh": "zh-CN", "ja": "ja", "ko": "ko", "es": "es"
+        }
+        mapped_lang = lang_map.get(target_lang.lower(), target_lang)
+        result = GoogleTranslator(source="auto", target=mapped_lang).translate(text)
+        if result and result.strip():
+            return result.strip()
+    except Exception as e:
+        print(f"[Translation Fallback Warning] deep-translator failed: {e}")
+    return ""
+
 @app.task(name="tasks.task_translate_segments")
 def task_translate_segments(project_id: str):
     db = get_db()
@@ -897,13 +1415,14 @@ def task_translate_segments(project_id: str):
                 if project.genre_mode == "anime_recap":
                     genre_instructions = (
                         f"Target language is '{target_lang}'. Anime recaps are fast-paced. "
-                        "Summarize the translation so the spoken words fit the tight original time window. "
-                        "Prioritize punchy, high-energy summaries over literal translation."
+                        "Translate the transcript directly. Make it punchy, energetic, and highly concise "
+                        "so the spoken translation fits the original timing. Do NOT write long summaries, "
+                        "and do NOT hallucinate or add details/sentences not present in the original transcript."
                     )
                 else:  # drama_recap
                     genre_instructions = (
                         f"Target language is '{target_lang}'. Focus on emotional accuracy "
-                        "and dramatic storytelling, maintaining natural conversational flow within the timestamps."
+                        "and dramatic storytelling, keeping the translation natural and concise within the timestamps."
                     )
 
                 # Map target language key to human readable names for Gemini
@@ -921,7 +1440,8 @@ def task_translate_segments(project_id: str):
                     "2. Do NOT include explanations, notes, intros, or markdown formatting.\n"
                     "3. Do NOT include or repeat the original English text.\n"
                     "4. Do NOT wrap your output in quotation marks.\n"
-                    "5. Translate completely—do not truncate, leave empty, or cut off sentences."
+                    "5. Translate completely—do not truncate, leave empty, or cut off sentences.\n"
+                    "6. Be extremely concise. Do NOT add extra context, commentary, action descriptions, or background stories. Only translate the spoken words of the transcript."
                 )
 
                 prompt = (
@@ -933,7 +1453,7 @@ def task_translate_segments(project_id: str):
                 )
 
                 translated_text = ""
-                if api_key and not gemini_disabled:
+                if api_key and not gemini_disabled and not quota_failed:
                     # 3. Gemini call with exponential backoff retry for 429 rate limiting
                     max_retries = 5
                     base_delay = 5.0
@@ -950,13 +1470,13 @@ def task_translate_segments(project_id: str):
                                 # 4. Standardize and Clean the Output String
                                 translated_text = raw_text.strip(" \"'\n\r")
                             else:
-                                translated_text = "[TRANSLATION_FAILED: Invalid API Response]"
+                                translated_text = ""
                             break  # Success — exit retry loop
                         except Exception as api_err:
                             err_str = str(api_err)
                             # Detect permanent quota limit first
                             if "quota" in err_str.lower() or ("limit" in err_str.lower() and "exceeded" in err_str.lower()) or "RESOURCE_EXHAUSTED" in err_str:
-                                print(f"[Queue 3] Gemini API quota limit exceeded or resource exhausted: {err_str}. Stopping translation pipeline and transitioning to manual mode.")
+                                print(f"[Queue 3] Gemini API quota limit exceeded or resource exhausted: {err_str}. Switching to offline translation.")
                                 quota_failed = True
                                 break
                             # Detect 429 rate limit
@@ -973,16 +1493,17 @@ def task_translate_segments(project_id: str):
                                 if attempt < max_retries - 1:
                                     time.sleep(retry_delay)
                                 else:
-                                    print(f"[Queue 3] Gemini rate limit: all {max_retries} retries exhausted for segment {current_seg.id}. Stopping translation pipeline.")
+                                    print(f"[Queue 3] Gemini rate limit: all {max_retries} retries exhausted for segment {current_seg.id}.")
                                     quota_failed = True
                                     break
                             else:
-                                print(f"[Queue 3] Non-retriable Gemini API error: {api_err}. Stopping translation pipeline.")
+                                print(f"[Queue 3] Non-retriable Gemini API error: {api_err}.")
                                 quota_failed = True
                                 break
                 else:
-                    print(f"[Queue 3] Gemini API key is missing or Gemini is disabled. Stopping translation pipeline and transitioning to manual mode.")
-                    quota_failed = True
+                    if not quota_failed:
+                        print(f"[Queue 3] Gemini API key is missing or Gemini is disabled.")
+                        quota_failed = True
 
                 if quota_failed:
                     break
@@ -1034,8 +1555,8 @@ def task_translate_segments(project_id: str):
                 logging.error(f"Translation logic crashed for segment {current_seg.id}: {segment_err}")
                 print(f"[Queue 3] Segment {current_seg.id} crashed during translation: {segment_err}")
 
-        # Transition all remaining segments if pipeline failed early
-        if quota_failed:
+        # Transition all remaining segments if pipeline failed early and loop did not finish
+        if quota_failed and i < len(segments):
             print(f"[Queue 3] Generating manual prompts for all remaining segments...")
             # Bug Fix: Define project_dir for the manual prompt generation path.
             project_dir = os.path.join(DATA_DIR, project_id)
@@ -1080,20 +1601,26 @@ def task_translate_segments(project_id: str):
                     f.write("To make translation fast and prevent context limits, the segments are divided into short parts.\n")
                     f.write("Copy the prompt for each part, paste it into ChatGPT/Claude/Gemini, and paste the results back.\n\n")
                     
-                    # Split into batches by word count (target ~1500 words)
+                    # Split into batches by total prompt word count (target 1500 - 2000 words per copied prompt)
                     batches = []
                     current_batch = []
-                    current_word_count = 0
+                    
+                    # Estimate the base instruction text length (approx. 280 words)
+                    base_prompt_words = 280
+                    current_prompt_words = base_prompt_words
                     
                     for seg in manual_segs:
-                        word_count = len(seg.original_text.split()) if seg.original_text else 0
-                        if current_batch and current_word_count + word_count > 1800:
+                        seg_text_words = len(seg.original_text.split()) if seg.original_text else 0
+                        # Account for line prefix/suffix metadata: "Line [id] | Duration: X.Xs\nEnglish: ..." (~12 words)
+                        seg_line_words = 12 + seg_text_words
+                        
+                        if current_batch and current_prompt_words + seg_line_words > 1700:
                             batches.append(current_batch)
                             current_batch = []
-                            current_word_count = 0
+                            current_prompt_words = base_prompt_words
                             
                         current_batch.append(seg)
-                        current_word_count += word_count
+                        current_prompt_words += seg_line_words
                         
                     if current_batch:
                         batches.append(current_batch)
@@ -1105,31 +1632,53 @@ def task_translate_segments(project_id: str):
                         f.write(f"================================================================================\n")
                         f.write(f"PART {b_idx + 1} OF {num_batches} (Segments {batch_segs[0].segment_index + 1} to {batch_segs[-1].segment_index + 1})\n")
                         f.write(f"================================================================================\n")
-                        f.write("Copy the text below (from 'You are a professional...' to 'Do not include notes'):\n\n")
+                        f.write("Copy the text below (from 'Act as an expert...' to 'Do not include notes'):\n\n")
                         
+                        # Clean project name to get a target manga name
+                        raw_name = project.name or ""
+                        import re as _re
+                        clean_manga_name = "[Insert Manga Name Here]"
+                        if raw_name:
+                            clean = _re.sub(r'\.(mp4|webm|mkv|avi|mov)$', '', raw_name, flags=_re.IGNORECASE)
+                            clean = _re.sub(r'[_-]+', ' ', clean)
+                            clean = _re.sub(r'(ytdown|youtube|media|720p|1080p|part|season|s\d+|eps?\d+)', '', clean, flags=_re.IGNORECASE)
+                            clean = _re.sub(r'\s+', ' ', clean).strip()
+                            if clean:
+                                clean_manga_name = clean
+
                         # Combined prompt text
-                        f.write("You are a professional English-to-Khmer localization translator for video recaps.\n")
+                        f.write("Act as an expert YouTube scriptwriter, a master storyteller, and a professional English-to-Khmer translator.\n\n")
+                        f.write(f"Target Manga: {clean_manga_name}\n")
+                        f.write("Target Language: Spoken Khmer\n\n")
+                        f.write("Step 1: Context & Lore\n")
+                        f.write(f"Before you translate, search your knowledge base for information about {clean_manga_name}. Understand the main characters' personalities, the world-building, and the current story arc so your translation perfectly matches the vibe of the manga.\n\n")
+                        f.write("Step 2: Translation & Storytelling\n")
+                        f.write("Translate the transcript I provide below into Khmer. However, do not just translate it word-for-word. Rewrite it into a highly addictive YouTube script following these rules:\n\n")
+                        f.write("Maximum Hook & Curiosity: Structure the story to create continuous hooks and open loop curiosity gaps. Start and end segments with transitions that make the viewer ask 'what happens next?' (e.g. 'ប៉ុន្តែរឿងដែលនឹកស្មានមិនដល់គឺ...', 'តើមានអ្វីកើតឡើងបន្តទៀត?').\n\n")
+                        f.write("Khmer Anime Recapper Style (សម្រាយរឿង Anime): Write strictly in the style of popular Khmer YouTube anime recappers. The tone must be like a friendly, fun, engaging MC/Host speaking directly to their fans (ហ្វេនៗ / ប្រិយមិត្ត). Rewrite the script to use popular recapper slang and expressions like 'តួឯកយើង' (our protagonist), 'អាល្អិតនេះ' (this kid), 'ខ្លាំងកប់ពពក' (insanely strong), 'ញាក់សាច់' (thrilling), 'ស្រឡាំងកាំងស្ទើរក្អួតឈាម' (stunned/vomiting blood), 'ដាច់ផ្ងារ' (shocked), 'ឡូយខ្លាំង/កប់ស៊េរី' (super cool/top tier). Do not do dry translations.\n\n")
+                        f.write("High Hype and Intensity: Make action scenes sound fast-paced, epic, and legendary. Emphasize emotional spikes, drama, and conflict to keep viewers highly engaged.\n\n")
+                        f.write("Natural Voiceover Style: Write in natural, spoken conversational Khmer (not stiff, formal written text). It must sound completely natural and smooth when read aloud by the narrator.\n\n")
+                        f.write("Director's Notes: Include short cues in brackets, like [Pause for suspense], [Say this with a sad voice], or [High energy!], to help me narrate the video perfectly.\n\n")
                         
                         if b_idx > 0:
-                            f.write("Wait until the previous part is completely finished. If you missed any line IDs from the previous part, please include their translations in this response before continuing.\n")
+                            f.write("Wait until the previous part is completely finished. If you missed any line IDs from the previous part, please include their translations in this response before continuing.\n\n")
                             
-                        f.write("Translate the following dialogue segments from English into natural, concise Khmer.\n")
-                        f.write("Ensure each line is short and fast to read so it fits the audio duration (about 3-4 Khmer characters per second of duration).\n\n")
-                        f.write("Input segments:\n")
+                        f.write("Here is the transcript you need to translate:\n")
                         f.write("--------------------------------------------------\n")
                         for s in batch_segs:
                             duration = s.end_time - s.start_time
                             if duration <= 0:
-                                duration = 1.0
+                                 duration = 1.0
                             f.write(f"Line [{s.id}] | Duration: {duration:.1f}s\n")
                             f.write(f"English: \"{s.original_text}\"\n\n")
                         f.write("--------------------------------------------------\n\n")
                         f.write("Instructions:\n")
-                        f.write("1. Translate all lines into natural Khmer.\n")
+                        f.write("1. Translate all lines into natural Spoken Khmer using the rules above.\n")
                         f.write("2. Return ONLY the translations in this exact format (including brackets and line IDs):\n")
                         f.write("[id] <Khmer translation>\n\n")
-                        f.write("Example:\n[1] ជំរាបសួរ\n[2] តើអ្នកសុខសប្បាយជាទេ?\n")
-                        f.write("\n3. Do not include any notes, formatting, introductory text, or markdown codeblocks.\n\n\n")
+                        f.write("3. CRITICAL: You must return exactly ONE translation line for each input ID. NEVER split a single input ID into multiple output IDs (e.g. do not turn Line [1] into [1] and [2]). If a Line contains a long paragraph or multiple sentences, translate them all together on a single line starting with that ID. Do not skip any IDs.\n\n")
+                        f.write("Example:\n[1] [High energy!] ជំរាបសួរអ្នកទាំងអស់គ្នា! ថ្ងៃនេះខ្ញុំនឹងនាំអ្នកទៅកាន់ពិភពថ្មីមួយ...\n[2] [Pause for suspense] ...\n")
+                        f.write("\n4. Do not include any notes, formatting, introductory text, or markdown codeblocks outside of the [id] brackets.\n\n\n")
                 
                 print(f"[Queue 3] API quota exceeded. Manual translation prompts saved to: {os.path.abspath(prompts_file_path)}")
             except Exception as file_err:
@@ -1280,11 +1829,15 @@ def task_synthesize_tts_segment(project_id: str, segment_id: int, force_no_short
                 elif effective_voice_type == "kid":
                     profile = "kid"
 
+                orig_dur = segment.end_time - segment.start_time
+                if orig_dur <= 0:
+                    orig_dur = 1.0
                 voxcpm2.generate(
                     text=synth_text,
                     output_path=output_wav,
                     voice_profile=profile,
-                    target_lang=project.target_language
+                    target_lang=project.target_language,
+                    original_duration=orig_dur
                 )
                 tts_success = os.path.exists(output_wav)
             except Exception as vox_exc:
@@ -1324,18 +1877,38 @@ def task_synthesize_tts_segment(project_id: str, segment_id: int, force_no_short
             edge_rate = voice_config["rate"]
             edge_pitch = voice_config["pitch"]
 
-            print(f"[Queue 4] Synthesizing segment {segment.segment_index} via Edge-TTS (voice={voice_gender_neural}, rate={edge_rate}, pitch={edge_pitch}, text={repr(synth_text[:60])})...")
-            edge_cmd = [
-                "edge-tts",
-                "--voice", voice_gender_neural,
-                "--rate", edge_rate,
-                "--pitch", edge_pitch,
-                "--text", synth_text,
-                "--write-media", output_wav
-            ]
-            res = subprocess.run(edge_cmd, capture_output=True)
-            if res.returncode != 0:
-                print(f"[Queue 4] Edge-TTS error: {res.stderr.decode()}. Writing fallback silent wave.")
+            # Run Edge-TTS in-process using the edge-tts Python library to avoid Windows command line length limits (WinError 206)
+            import asyncio
+            import edge_tts
+
+            async def run_edge_tts_async():
+                communicate = edge_tts.Communicate(
+                    text=synth_text,
+                    voice=voice_gender_neural,
+                    rate=edge_rate,
+                    pitch=edge_pitch
+                )
+                await communicate.save(output_wav)
+
+            # Retry mechanism for robust network calls (transient failures/rate limits)
+            max_retries = 3
+            edge_tts_success = False
+            for attempt in range(1, max_retries + 1):
+                try:
+                    asyncio.run(run_edge_tts_async())
+                    if os.path.exists(output_wav) and os.path.getsize(output_wav) > 0:
+                        edge_tts_success = True
+                        break
+                    else:
+                        raise FileNotFoundError("Output file is empty or not created")
+                except Exception as edge_exc:
+                    print(f"[Queue 4] Edge-TTS attempt {attempt}/{max_retries} failed for segment {segment.segment_index}: {edge_exc}")
+                    if attempt < max_retries:
+                        # Exponential backoff: sleep 1.5s, 3s...
+                        time.sleep(attempt * 1.5)
+
+            if not edge_tts_success:
+                print(f"[Queue 4] Edge-TTS failed after {max_retries} attempts. Writing fallback silent wave.")
                 import wave
                 with wave.open(output_wav, 'wb') as w:
                     w.setnchannels(1)
@@ -1388,15 +1961,16 @@ def task_synthesize_tts_segment(project_id: str, segment_id: int, force_no_short
 
         # To prevent the video moving faster than the sound, we must allow the audio 
         # to speed up enough to fit the original duration perfectly.
-        atempo_val = max(1.0, min(1.5, speed_multiplier))
-        filter_str = f"atempo={atempo_val:.4f},highpass=f=80,lowpass=f=12000,volume=1.4,afftdn=nf=-35"
+        max_speed = float(os.getenv("MAX_SPEED_MULTIPLIER", "1.3"))
+        atempo_val = max(0.9, min(max_speed, speed_multiplier))
+        filter_str = f"atempo={atempo_val:.4f},volume=1.2"
         stretch_cmd = [
-            "ffmpeg", "-y",
+            "ffmpeg", "-y", "-nostdin",
             "-i", output_wav,
             "-filter:a", filter_str,
             final_wav
         ]
-        subprocess.run(stretch_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(stretch_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         segment.audio_path = final_wav
         segment.status = "synthesized"
         
@@ -1425,6 +1999,15 @@ def task_synthesize_tts_segment(project_id: str, segment_id: int, force_no_short
         return {"status": "failed", "error": str(e), "traceback": tb}
     finally:
         db.close()
+        # Free CUDA memory cache and trigger garbage collection to prevent Windows VRAM paging
+        try:
+            import gc
+            import torch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 @app.task(name="tasks.task_re_render_segment")
 def task_re_render_segment(project_id: str, segment_id: int):
@@ -1501,52 +2084,95 @@ def task_composite_and_export(project_id: str):
         mixed_audio_path = os.path.join(project_dir, "final_dubbed_audio.wav")
         vocals_mix_path = os.path.join(project_dir, "vocals_mix.wav")
 
-        assemble_vocals_track(vocals_mix_path, segments)
-
-        if project.enable_background_sound and project.bgm_path and os.path.exists(project.bgm_path):
-            print(f"[Queue 5] Background sound enabled. Mixing with BGM ducking...")
-            ducking_filter = (
-                f"[1:a]volume=2.5,asplit[v_duck][v_direct];"
-                f"[0:a]volume=0.4[bgm_quiet];"
-                f"[bgm_quiet][v_duck]sidechaincompress=threshold=0.1:ratio=4:attack=50:release=300:makeup=1.0[bgm_ducked];"
-                f"[bgm_ducked][v_direct]amix=inputs=2:duration=first:dropout_transition=2[a_mixed_raw];"
-                f"[a_mixed_raw]volume=2.0[a_mixed]"
-            )
-            duck_cmd = [
-                "ffmpeg", "-y",
-                "-i", project.bgm_path,
-                "-i", vocals_mix_path,
-                "-filter_complex", ducking_filter,
-                "-map", "[a_mixed]",
-                mixed_audio_path
-            ]
-            subprocess.run(duck_cmd, check=True)
+        if os.path.exists(mixed_audio_path) and os.path.getsize(mixed_audio_path) > 1000000:
+            print(f"[Queue 5] Final dubbed audio already exists ({os.path.getsize(mixed_audio_path)} bytes). Skipping mix stage.")
         else:
-            print(f"[Queue 5] Background sound disabled or missing. Using vocals track only.")
-            copy_cmd = [
-                "ffmpeg", "-y",
-                "-i", vocals_mix_path,
-                "-filter:a", "volume=2.5",
-                "-c:a", "pcm_s16le",
-                mixed_audio_path
-            ]
-            subprocess.run(copy_cmd, check=True)
+            assemble_vocals_track(vocals_mix_path, segments)
+
+            if project.enable_background_sound and project.bgm_path and os.path.exists(project.bgm_path):
+                print(f"[Queue 5] Background sound enabled. Mixing with BGM ducking...")
+                ducking_filter = (
+                    f"[1:a]volume=2.5,asplit[v_duck][v_direct];"
+                    f"[0:a]volume=0.4[bgm_quiet];"
+                    f"[bgm_quiet][v_duck]sidechaincompress=threshold=0.1:ratio=4:attack=50:release=300:makeup=1.0[bgm_ducked];"
+                    f"[bgm_ducked][v_direct]amix=inputs=2:duration=first:dropout_transition=2[a_mixed_raw];"
+                    f"[a_mixed_raw]volume=2.0[a_mixed]"
+                )
+                duck_cmd = [
+                    "ffmpeg", "-y", "-nostdin",
+                    "-i", project.bgm_path,
+                    "-i", vocals_mix_path,
+                    "-filter_complex", ducking_filter,
+                    "-map", "[a_mixed]",
+                    mixed_audio_path
+                ]
+                subprocess.run(duck_cmd, stdin=subprocess.DEVNULL, check=True)
+            else:
+                print(f"[Queue 5] Background sound disabled or missing. Using vocals track only.")
+                copy_cmd = [
+                    "ffmpeg", "-y", "-nostdin",
+                    "-i", vocals_mix_path,
+                    "-filter:a", "volume=2.5",
+                    "-c:a", "pcm_s16le",
+                    mixed_audio_path
+                ]
+                subprocess.run(copy_cmd, stdin=subprocess.DEVNULL, check=True)
 
         # Convert path to forward slashes and escape backslashes/colons for ffmpeg filters on Windows
         ffmpeg_ass_path = ass_path.replace("\\", "/")
         if ":" in ffmpeg_ass_path:
             ffmpeg_ass_path = ffmpeg_ass_path.replace(":", "\\:")
 
-        # Check if CUDA is available for GPU accelerated encoding
+        # Check if CUDA is available for GPU accelerated encoding/decoding
         import torch
-        if torch.cuda.is_available():
+        gpu_decode_args = []
+        if not has_video_stretch and not getattr(project, "enable_subtitles", True):
+            print("[Queue 5] No subtitles and no video stretch. Using stream copy for video (instant).")
+            video_encoder = ["-c:v", "copy"]
+            shorts_encoder = ["-c:v", "copy"]
+        elif torch.cuda.is_available():
             print("[Queue 5] CUDA GPU detected. Using h264_nvenc for fast video encoding.")
-            video_encoder = ["-c:v", "h264_nvenc", "-preset", "fast", "-rc", "vbr", "-cq", "22"]
-            shorts_encoder = ["-c:v", "h264_nvenc", "-preset", "fast", "-rc", "vbr", "-cq", "20"]
+            video_encoder = ["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "vbr", "-cq", "22"]
+            shorts_encoder = ["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "vbr", "-cq", "20"]
+            gpu_decode_args = ["-hwaccel", "cuda"]
         else:
             print("[Queue 5] CUDA GPU not available or not active. Falling back to libx264 CPU encoding.")
-            video_encoder = ["-c:v", "libx264", "-preset", "fast", "-crf", "22"]
-            shorts_encoder = ["-c:v", "libx264", "-crf", "20"]
+            video_encoder = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "22"]
+            shorts_encoder = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "20"]
+
+        # Transcode source video to a fast intermediate format to speed up the complex filtergraph seek/decode
+        fast_video_path = project.video_path
+        temp_fast_video = None
+        if has_video_stretch:
+            print("[Queue 5] Pre-transcoding video to fast-seeking H.264 intermediate...")
+            temp_fast_video = os.path.join(project_dir, "temp_fast_decode.mp4")
+            
+            # Use GPU if available, fallback to CPU
+            if torch.cuda.is_available():
+                transcode_cmd = [
+                    "ffmpeg", "-y", "-nostdin",
+                    "-hwaccel", "cuda",
+                    "-i", project.video_path,
+                    "-c:v", "h264_nvenc", "-preset", "p1",
+                    "-g", "15", "-keyint_min", "15", # Short GOP for fast seeking
+                    "-an", # Drop audio for speed and space
+                    temp_fast_video
+                ]
+            else:
+                transcode_cmd = [
+                    "ffmpeg", "-y", "-nostdin",
+                    "-i", project.video_path,
+                    "-c:v", "libx264", "-preset", "ultrafast",
+                    "-g", "15", "-keyint_min", "15", # Short GOP
+                    "-an",
+                    temp_fast_video
+                ]
+            try:
+                subprocess.run(transcode_cmd, stdin=subprocess.DEVNULL, check=True)
+                fast_video_path = temp_fast_video
+                print("[Queue 5] Fast intermediate video created successfully.")
+            except Exception as trans_err:
+                print(f"[Queue 5] Pre-transcoding failed: {trans_err}. Using original video.")
 
         # 3. Output 16:9 MP4 Video
         output_16_9 = os.path.join(project_dir, "output_16_9.mp4")
@@ -1581,15 +2207,23 @@ def task_composite_and_export(project_id: str):
                 ]
 
         video_cmd = [
-            "ffmpeg", "-y",
-            "-i", project.video_path,
+            "ffmpeg", "-y", "-nostdin",
+        ] + gpu_decode_args + [
+            "-i", fast_video_path,
             "-i", mixed_audio_path,
         ] + video_filters_args + video_encoder + [
             "-c:a", "aac",
             "-b:a", "192k",
             output_16_9
         ]
-        subprocess.run(video_cmd, check=True)
+        subprocess.run(video_cmd, stdin=subprocess.DEVNULL, check=True)
+
+        # Cleanup intermediate video
+        if temp_fast_video and os.path.exists(temp_fast_video):
+            try:
+                os.remove(temp_fast_video)
+            except Exception as clean_err:
+                print(f"[Queue 5] Could not remove temp_fast_decode: {clean_err}")
 
         project.output_video_16_9 = output_16_9
         db.commit()
@@ -1600,7 +2234,7 @@ def task_composite_and_export(project_id: str):
             best_start, best_end = find_highest_density_window(segments, window_size=60)
             
             crop_cmd = [
-                "ffmpeg", "-y",
+                "ffmpeg", "-y", "-nostdin",
                 "-ss", str(best_start),
                 "-t", "60",
                 "-i", output_16_9,
@@ -1609,7 +2243,7 @@ def task_composite_and_export(project_id: str):
                 "-c:a", "copy",
                 output_9_16
             ]
-            subprocess.run(crop_cmd, check=True)
+            subprocess.run(crop_cmd, stdin=subprocess.DEVNULL, check=True)
             project.output_video_9_16 = output_9_16
             db.commit()
 
@@ -1757,14 +2391,13 @@ def capture_and_score_thumbnails(project_id: str, video_path: str, db: Session):
     except:
         duration = 180.0
 
-    step = 30.0
+    step = max(30.0, duration / 15.0)
     current_time = 30.0
     api_key = os.getenv("GEMINI_API_KEY")
 
     while current_time < duration - 10:
         thumb_name = f"thumbnail_{int(current_time)}.jpg"
         thumb_path = os.path.join(project_dir, thumb_name)
-
         shot_cmd = [
             "ffmpeg", "-y",
             "-ss", str(current_time),
@@ -1773,8 +2406,7 @@ def capture_and_score_thumbnails(project_id: str, video_path: str, db: Session):
             "-q:v", "2",
             thumb_path
         ]
-        subprocess.run(shot_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
+        subprocess.run(shot_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if os.path.exists(thumb_path):
             # Fast mock scoring (disabled Gemini API for speed)
             import random
@@ -1801,3 +2433,77 @@ def task_cleanup_old_projects(project_id: str):
     """Scheduled task to clean up old projects."""
     print(f"[Queue 5] Scheduled cleanup for project {project_id}")
     pass
+
+if __name__ == "__main__":
+    import sys
+    import json
+    if len(sys.argv) > 1 and sys.argv[1] == "--persistent-worker":
+        # We are the persistent worker process!
+        os.environ["IS_TASK_SUBPROCESS"] = "1"
+        
+        # Redirect standard output to standard error to avoid polluting the stdout channel
+        # which is used for communicating task execution status with the parent process.
+        original_stdout = sys.stdout
+        sys.stdout = sys.stderr
+        
+        print("[Persistent Worker] Started and listening on stdin...", file=sys.stderr)
+        
+        while True:
+            try:
+                line = sys.stdin.readline()
+                if not line:
+                    print("[Persistent Worker] stdin closed. Exiting.", file=sys.stderr)
+                    break
+                
+                payload = json.loads(line.strip())
+                task_name = payload.get("task_name")
+                args = payload.get("args", [])
+                kwargs = payload.get("kwargs", {})
+                
+                func = globals().get(task_name)
+                if func:
+                    print(f"[Persistent Worker] Executing task {task_name}...", file=sys.stderr)
+                    func(*args, **kwargs)
+                    print(f"[Persistent Worker] Completed task {task_name}.", file=sys.stderr)
+                    status_payload = {"status": "success", "task_name": task_name}
+                else:
+                    print(f"[Persistent Worker Error] Task {task_name} not found in tasks.py!", file=sys.stderr)
+                    status_payload = {"status": "error", "error": f"Task {task_name} not found"}
+            except Exception as e:
+                print(f"[Persistent Worker Exception] {e}", file=sys.stderr)
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+                status_payload = {"status": "error", "error": str(e)}
+                
+            try:
+                original_stdout.write(json.dumps(status_payload) + "\n")
+                original_stdout.flush()
+            except Exception as write_err:
+                print(f"[Persistent Worker] Error writing response: {write_err}", file=sys.stderr)
+        sys.exit(0)
+    elif len(sys.argv) > 2:
+        task_name = sys.argv[1]
+        payload_str = sys.argv[2]
+        try:
+            payload = json.loads(payload_str)
+            args = payload.get("args", [])
+            kwargs = payload.get("kwargs", {})
+            
+            # Set the environment variable so imported modules know it's a subprocess
+            os.environ["IS_TASK_SUBPROCESS"] = "1"
+            
+            # Find the function in globals
+            func = globals().get(task_name)
+            if func:
+                print(f"[Subprocess Task Runner] Executing {task_name} with args={args} kwargs={kwargs}...")
+                func(*args, **kwargs)
+                print(f"[Subprocess Task Runner] Finished {task_name}.")
+                sys.exit(0)
+            else:
+                print(f"[Subprocess Task Runner Error] Task {task_name} not found in tasks.py!")
+                sys.exit(1)
+        except Exception as e:
+            print(f"[Subprocess Task Runner Exception] {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)

@@ -51,4 +51,8 @@ def open_browser():
 
 if __name__ == "__main__":
     threading.Thread(target=open_browser, daemon=True).start()
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_config=LOGGING_CONFIG)
+    if getattr(sys, 'frozen', False):
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_config=LOGGING_CONFIG)
+    else:
+        # Dev/console mode: use standard uvicorn logging to avoid console logging conflicts and crash
+        uvicorn.run(app, host="0.0.0.0", port=8000)

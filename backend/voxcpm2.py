@@ -30,8 +30,34 @@ _generate_lock = threading.Lock()
 # It will force VoxCPM2 to clone these exact voices for EVERY sentence, 
 # ensuring 100% consistency throughout the entire video.
 # ==============================================================================
-SELECTED_MALE_VOICE_FILE = r"Z:\year3\projecj video translate backup\backend\voice_samples\faster_gentle_recap\faster_gentle_var_7_seed_10451.wav"
-SELECTED_FEMALE_VOICE_FILE = r"Z:\year3\projecj video translate backup\backend\voice_samples\faster_gentle_recap\faster_gentle_var_9_seed_23843.wav"
+
+def resolve_voice_file(file_path, default_rel_path):
+    # 1. Check if the original path exists
+    if file_path and os.path.exists(file_path):
+        return file_path
+    
+    # 2. Check in frozen folder structure
+    import sys
+    if getattr(sys, 'frozen', False):
+        frozen_path = os.path.join(sys._MEIPASS, default_rel_path.replace("/", os.sep))
+        if os.path.exists(frozen_path):
+            return frozen_path
+            
+    # 3. Check relative path in dev mode
+    dev_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), default_rel_path.replace("/", os.sep))
+    if os.path.exists(dev_path):
+        return dev_path
+        
+    return None
+
+SELECTED_MALE_VOICE_FILE = resolve_voice_file(
+    r"Z:\year3\projecj video translate backup\backend\voice_samples\clean\male.wav",
+    r"voice_samples/clean/male.wav"
+)
+SELECTED_FEMALE_VOICE_FILE = resolve_voice_file(
+    r"Z:\year3\projecj video translate backup\backend\voice_samples\clean\female.wav",
+    r"voice_samples/clean/female.wav"
+)
 
 
 
@@ -39,14 +65,26 @@ SELECTED_FEMALE_VOICE_FILE = r"Z:\year3\projecj video translate backup\backend\v
 
 def _resolve_model_source() -> tuple[str, dict[str, object]]:
     """Pick the best available VoxCPM2 source for this machine."""
+    import sys
+    
+    # 1. If frozen, check next to the executable first
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+        local_model_dir = Path(exe_dir) / "VoxCPM2_Model"
+        if (local_model_dir / "model.safetensors").exists():
+            return str(local_model_dir), {"local_files_only": True}
+
+    # 2. Check the parent directory of the source code (dev mode)
     local_model_dir = BASE_DIR.parent / "VoxCPM2_Model"
     if (local_model_dir / "model.safetensors").exists():
         return str(local_model_dir), {"local_files_only": True}
 
+    # 3. Check environment variable path override
     env_path = os.getenv("VOXCPM2_MODEL_PATH", "").strip()
     if env_path and Path(env_path).is_dir():
         return env_path, {"local_files_only": True}
 
+    # 4. Check cache dir
     local_cache_dir = local_model_dir / ".cache" / "huggingface"
     if local_cache_dir.exists():
         return "openbmb/VoxCPM2", {"cache_dir": str(local_cache_dir)}
@@ -155,6 +193,11 @@ def _save_wav_or_convert(wav, output_path: Path, sample_rate: int) -> None:
     if wav.ndim == 2 and wav.shape[0] in {1, 2} and wav.shape[0] < wav.shape[-1]:
         wav = wav.T
 
+    # Peak normalization to achieve maximum volume without clipping
+    peak = np.abs(wav).max()
+    if peak > 0:
+        wav = wav / peak
+
     if output_path.suffix.lower() == ".wav":
         sf.write(str(output_path), wav, sample_rate)
         return
@@ -178,17 +221,72 @@ def _estimate_max_len(text: str) -> int:
     return min(VOXCPM2_MAX_LEN, estimated)
 
 
-def generate(text: str, output_path: str, voice_profile: str = "female", target_lang: str = "km", style: dict = None) -> str:
+def generate(text: str, output_path: str, voice_profile: str = "female", target_lang: str = "km", style: dict = None, original_duration: float = None) -> str:
     """
     Main entry point for VoxCPM2 TTS generation.
     Supports Voice Design, Controllable Voice Cloning, and style instructions.
     """
     model = get_model()
 
+    is_khmer = any(0x1780 <= ord(c) <= 0x17FF for c in text)
+
+    # Split text into smaller chunks to prevent CUDA out-of-memory errors on long segments
+    # Each chunk will be synthesized separately and then concatenated.
+    max_chars = 120  # Keeps GPU VRAM usage small and safe
+    
+    # First, split by standard sentence delimiters (periods, question marks, exclamations, newlines)
+    parts = [p.strip() for p in re.split(r'([។?!\n\r])', text) if p.strip()]
+    
+    # Reassemble delimiters with preceding clauses
+    sentences = []
+    current = ""
+    for p in parts:
+        if p in {"។", "?", "!", "\n", "\r"}:
+            if current:
+                sentences.append(current + p)
+                current = ""
+            else:
+                sentences.append(p)
+        else:
+            if current:
+                sentences.append(current)
+            current = p
+    if current:
+        sentences.append(current)
+
+    chunks = []
+    for s in sentences:
+        if len(s) <= max_chars:
+            chunks.append(s)
+        else:
+            # If a single sentence/clause is longer than max_chars, split by spaces
+            words = s.split(" ")
+            curr_chunk = ""
+            for w in words:
+                if len(w) > max_chars:
+                    if curr_chunk:
+                        chunks.append(curr_chunk)
+                        curr_chunk = ""
+                    for idx in range(0, len(w), max_chars):
+                        chunks.append(w[idx:idx+max_chars])
+                else:
+                    if len(curr_chunk) + len(w) + 1 <= max_chars:
+                        curr_chunk = (curr_chunk + " " + w).strip()
+                    else:
+                        if curr_chunk:
+                            chunks.append(curr_chunk)
+                        curr_chunk = w
+            if curr_chunk:
+                chunks.append(curr_chunk)
+    
+    chunks = [c for c in chunks if c.strip()]
+    if not chunks:
+        chunks = [" "]
+
     # 2. Check if voice_profile is a path to a reference audio file (Voice Cloning)
     reference_wav_path = None
     
-    # --- Step 2: Apply Global Voice Override ---
+    # --- Apply Global Voice Override ---
     requested_profile = (voice_profile or "").strip().lower()
     override_file = None
     
@@ -203,16 +301,13 @@ def generate(text: str, output_path: str, voice_profile: str = "female", target_
     elif voice_profile and os.path.exists(voice_profile):
         reference_wav_path = voice_profile
 
-
-    # 3. Format the text for Voice Design.
-    # User requested to drop all per-segment persona modifications.
-    # We pass the text cleanly without any (A professional...) prepends.
-
-    print(f"🎤 Synthesizing with VoxCPM2: text={repr(text)}, target_lang={target_lang}")
+    print(f"🎤 Synthesizing with VoxCPM2 ({len(chunks)} chunks): text={repr(text[:120])}..., target_lang={target_lang}")
     if reference_wav_path:
         print(f"📂 Using reference audio for cloning: {reference_wav_path}")
 
-    # 4. Generate the audio waveform
+    # Generate the audio waveform for each chunk
+    chunk_wavs = []
+    
     with _generate_lock:
         import torch
         import random
@@ -225,25 +320,61 @@ def generate(text: str, output_path: str, voice_profile: str = "female", target_
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed_val)
 
-        if reference_wav_path:
-            wav = model.generate(
-                text=text,
-                reference_wav_path=reference_wav_path,
-                cfg_value=VOXCPM2_CFG_VALUE,
-                inference_timesteps=VOXCPM2_INFERENCE_TIMESTEPS,
-                max_len=_estimate_max_len(text),
-                retry_badcase=VOXCPM2_RETRY_BADCASE,
-                retry_badcase_max_times=1,
-            )
-        else:
-            wav = model.generate(
-                text=text,
-                cfg_value=VOXCPM2_CFG_VALUE,
-                inference_timesteps=VOXCPM2_INFERENCE_TIMESTEPS,
-                max_len=_estimate_max_len(text),
-                retry_badcase=VOXCPM2_RETRY_BADCASE,
-                retry_badcase_max_times=1,
-            )
+        for i, chunk in enumerate(chunks):
+            # Dynamic max_len calculation for each chunk to avoid huge silence tails
+            char_count_chunk = len(re.sub(r"\s+", "", chunk))
+            base_estimated = int(char_count_chunk * (4.5 if is_khmer else 6.0)) + 165
+            max_len_val = min(VOXCPM2_MAX_LEN, max(100, base_estimated))
+            
+            print(f"[VoxCPM2 Chunk {i+1}/{len(chunks)}] Synthesizing: {repr(chunk[:60])} (len={len(chunk)}, max_len={max_len_val})")
+            
+            if reference_wav_path:
+                w_chunk = model.generate(
+                    text=chunk,
+                    reference_wav_path=reference_wav_path,
+                    cfg_value=VOXCPM2_CFG_VALUE,
+                    inference_timesteps=VOXCPM2_INFERENCE_TIMESTEPS,
+                    max_len=max_len_val,
+                    retry_badcase=VOXCPM2_RETRY_BADCASE,
+                    retry_badcase_max_times=3,
+                )
+            else:
+                w_chunk = model.generate(
+                    text=chunk,
+                    cfg_value=VOXCPM2_CFG_VALUE,
+                    inference_timesteps=VOXCPM2_INFERENCE_TIMESTEPS,
+                    max_len=max_len_val,
+                    retry_badcase=VOXCPM2_RETRY_BADCASE,
+                    retry_badcase_max_times=3,
+                )
+
+            if hasattr(w_chunk, "detach"):
+                w_chunk = w_chunk.detach().cpu().numpy()
+            else:
+                w_chunk = np.asarray(w_chunk)
+
+            # Standardize dimensions to 1D
+            if w_chunk.ndim == 2:
+                if w_chunk.shape[0] == 1:
+                    w_chunk = w_chunk[0]
+                elif w_chunk.shape[1] == 1:
+                    w_chunk = w_chunk[:, 0]
+            elif w_chunk.ndim > 2:
+                w_chunk = w_chunk.flatten()
+
+            chunk_wavs.append(w_chunk)
+
+            # Insert small silence (breath pause) between chunks (e.g. 0.18s)
+            silence_samples = int(0.18 * model.tts_model.sample_rate)
+            chunk_wavs.append(np.zeros(silence_samples, dtype=w_chunk.dtype))
+
+    # Concatenate all generated audio chunks
+    if chunk_wavs:
+        # Skip the trailing silence
+        wav = np.concatenate(chunk_wavs[:-1], axis=0)
+    else:
+        # Fallback silent wave if something went wrong
+        wav = np.zeros(16000, dtype=np.float32)
 
     # 5. Save output file
     output_path_obj = Path(output_path)

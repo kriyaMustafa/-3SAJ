@@ -7,6 +7,7 @@ export default function App() {
   const [enableSubtitles, setEnableSubtitles] = createSignal(true);
   
   const [projectId, setProjectId] = createSignal(null);
+  const [projectName, setProjectName] = createSignal("");
   const [job, setJob] = createSignal({ step: "Idle", progress: 0, detail: "Select a video to begin", eta: null });
   const [isRunning, setIsRunning] = createSignal(false);
   const [isCompleted, setIsCompleted] = createSignal(false);
@@ -16,6 +17,55 @@ export default function App() {
   const [submitBusy, setSubmitBusy] = createSignal(false);
   const [copiedId, setCopiedId] = createSignal(null);
   const [downloadUrl, setDownloadUrl] = createSignal(null);
+
+  const [countdownSeconds, setCountdownSeconds] = createSignal(null);
+
+  // Helper to parse backend ETA string (e.g. "5m 48s", "45s", "1h 10m") into total seconds
+  const parseEta = (etaStr) => {
+    if (!etaStr || etaStr === "Calculating..." || etaStr === "0s") return null;
+    let seconds = 0;
+    let match = etaStr.match(/(\d+)h\s*(\d*)m?/);
+    if (match && etaStr.includes("h")) {
+      seconds = parseInt(match[1]) * 3600 + (match[2] ? parseInt(match[2]) * 60 : 0);
+      return seconds;
+    }
+    match = etaStr.match(/(\d+)m\s*(\d*)s?/);
+    if (match && etaStr.includes("m")) {
+      seconds = parseInt(match[1]) * 60 + (match[2] ? parseInt(match[2]) : 0);
+      return seconds;
+    }
+    match = etaStr.match(/(\d+)s/);
+    if (match) {
+      seconds = parseInt(match[1]);
+      return seconds;
+    }
+    return null;
+  };
+
+  // Helper to format seconds back to readable ETA string
+  const formatEta = (seconds) => {
+    if (seconds <= 0) return "0s";
+    if (seconds < 60) return `${seconds}s`;
+    const mins = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    if (mins < 60) {
+      return `${mins}m ${s}s`;
+    }
+    const hrs = Math.floor(mins / 60);
+    const m = mins % 60;
+    return `${hrs}h ${m}m`;
+  };
+
+  // Set up local second-by-second countdown timer
+  createEffect(() => {
+    const timer = setInterval(() => {
+      const current = countdownSeconds();
+      if (current !== null && current > 0 && isRunning()) {
+        setCountdownSeconds(current - 1);
+      }
+    }, 1000);
+    onCleanup(() => clearInterval(timer));
+  });
 
   let wsRef = null;
   const hostname = window.location.hostname;
@@ -28,26 +78,43 @@ export default function App() {
     wsRef = setInterval(async () => {
       try {
         const res = await fetch(`${apiBase}/api/projects/${id}`);
+        if (res.status === 404) {
+          // Clear active project
+          clearInterval(wsRef);
+          localStorage.removeItem("activeProjectId");
+          setProjectId(null);
+          setIsRunning(false);
+          setJob({ step: "Idle", progress: 0, detail: "Select a video to begin", eta: null });
+          setCountdownSeconds(null);
+          return;
+        }
         if (!res.ok) return;
         const data = await res.json();
         const p = data.project;
-        
+        setProjectName(p.name || "");
         setJob({
           step: p.status.charAt(0).toUpperCase() + p.status.slice(1),
-          progress: data.progress_percentage || 0,
-          detail: "Working...",
-          eta: null
+          progress: p.progress || 0,
+          detail: p.detail || "Working...",
+          eta: p.eta || "Calculating..."
         });
+
+        // Sync local countdown with backend ETA
+        const secs = parseEta(p.eta);
+        if (secs !== null) {
+          setCountdownSeconds(secs);
+        }
 
         if (p.status === "needs_manual_translation") {
           setShowManualReview(true);
         }
 
-        if (p.status === "completed" || data.progress_percentage >= 100) {
+        if (p.status === "completed" || p.progress >= 100) {
           setIsRunning(false);
           setIsCompleted(true);
           setDownloadUrl(`${apiBase}/api/downloads/${id}/video/mp4`);
           clearInterval(wsRef);
+          setCountdownSeconds(null);
         } else if (p.status === "failed") {
           setIsRunning(false);
           clearInterval(wsRef);
@@ -65,6 +132,23 @@ export default function App() {
       setIsRunning(true);
       setJob({ step: "Reconnecting", progress: 0, detail: "Restoring active session...", eta: null });
       startPolling(savedId);
+    } else if (!projectId() && !isRunning() && !isCompleted()) {
+      // Auto-detect if there is an active running project on the server
+      fetch(`${apiBase}/api/projects`)
+        .then(res => res.json())
+        .then(projects => {
+          if (Array.isArray(projects) && projects.length > 0) {
+            const latest = projects[0];
+            if (latest.status !== "completed" && latest.status !== "failed" && latest.status !== "cancelled") {
+              console.log("Auto-detected active project:", latest.id);
+              setProjectId(latest.id);
+              setIsRunning(true);
+              localStorage.setItem("activeProjectId", latest.id);
+              startPolling(latest.id);
+            }
+          }
+        })
+        .catch(console.error);
     }
   });
 
@@ -114,6 +198,7 @@ export default function App() {
       
       const projData = await processRes.json();
       setProjectId(projData.project_id);
+      setProjectName(projData.name || "");
       localStorage.setItem("activeProjectId", projData.project_id);
       startPolling(projData.project_id);
       
@@ -151,10 +236,44 @@ export default function App() {
     const segs = manualSegments();
     if (!segs.length) return;
 
-    let combinedPrompt = "You are a professional English-to-Khmer localization translator for video recaps.\n" +
-      "Translate the following dialogue segments from English into natural, concise Khmer.\n" +
-      "Ensure each line is short and fast to read so it fits the audio duration (about 3-4 Khmer characters per second of duration).\n\n" +
-      "Input segments:\n--------------------------------------------------\n";
+    // Clean project name to get a target manga name
+    const rawName = projectName() || "";
+    let cleanMangaName = "[Insert Manga Name Here]";
+    if (rawName) {
+      // Remove file extensions
+      let clean = rawName.replace(/\.(mp4|webm|mkv|avi|mov)$/i, "");
+      // Replace underscores and hyphens with spaces
+      clean = clean.replace(/[_-]+/g, " ");
+      // Remove common YouTube/Rip patterns
+      clean = clean.replace(/(ytdown|youtube|media|720p|1080p|part|season|s\d+|eps?\d+)/gi, "");
+      clean = clean.replace(/\s+/g, " ").trim();
+      if (clean) cleanMangaName = clean;
+    }
+
+    let combinedPrompt = `Act as an expert YouTube scriptwriter, a master storyteller, and a professional English-to-Khmer translator.
+
+Target Manga: ${cleanMangaName}
+Target Language: Spoken Khmer
+
+Step 1: Context & Lore
+Before you translate, search your knowledge base for information about ${cleanMangaName}. Understand the main characters' personalities, the world-building, and the current story arc so your translation perfectly matches the vibe of the manga.
+
+Step 2: Translation & Storytelling
+Translate the transcript I provide below into Khmer. However, do not just translate it word-for-word. Rewrite it into a highly addictive YouTube script following these rules:
+
+Maximum Hook & Curiosity: Structure the story to create continuous hooks and open loop curiosity gaps. Start and end segments with transitions that make the viewer ask 'what happens next?' (e.g. 'ប៉ុន្តែរឿងដែលនឹកស្មានមិនដល់គឺ...', 'តើមានអ្វីកើតឡើងបន្តទៀត?').
+
+Khmer Anime Recapper Style (សម្រាយរឿង Anime): Write strictly in the style of popular Khmer YouTube anime recappers. The tone must be like a friendly, fun, engaging MC/Host speaking directly to their fans (ហ្វេនៗ / ប្រិយមិត្ត). Rewrite the script to use popular recapper slang and expressions like 'តួឯកយើង' (our protagonist), 'អាល្អិតនេះ' (this kid), 'ខ្លាំងកប់ពពក' (insanely strong), 'ញាក់សាច់' (thrilling), 'ស្រឡាំងកាំងស្ទើរក្អួតឈាម' (stunned/vomiting blood), 'ដាច់ផ្ងារ' (shocked), 'ឡូយខ្លាំង/កប់ស៊េរី' (super cool/top tier). Do not do dry translations.
+
+High Hype and Intensity: Make action scenes sound fast-paced, epic, and legendary. Emphasize emotional spikes, drama, and conflict to keep viewers highly engaged.
+
+Natural Voiceover Style: Write in natural, spoken conversational Khmer (not stiff, formal written text). It must sound completely natural and smooth when read aloud by the narrator.
+
+Director's Notes: Include short cues in brackets, like [Pause for suspense], [Say this with a sad voice], or [High energy!], to help me narrate the video perfectly.
+
+Here is the transcript you need to translate:
+--------------------------------------------------
+`;
 
     segs.forEach(s => {
       let duration = s.end_time - s.start_time;
@@ -163,17 +282,25 @@ export default function App() {
       combinedPrompt += `English: "${s.original_text}"\n\n`;
     });
 
-    combinedPrompt += "--------------------------------------------------\n\n" +
-      "Instructions:\n1. Translate all lines into natural Khmer.\n" +
-      "2. Return ONLY the translations in this exact format (including brackets and line IDs):\n" +
-      "[id] <Khmer translation>\n\n" +
-      "Example:\n[1] ជំរាបសួរ\n[2] តើអ្នកសុខសប្បាយជាទេ?\n";
+    combinedPrompt += `--------------------------------------------------
 
-    combinedPrompt += "\n3. Do not include any notes, formatting, introductory text, or markdown codeblocks.\n";
+Instructions:
+1. Translate all lines into natural Spoken Khmer using the rules above.
+2. Return ONLY the translations in this exact format (including brackets and line IDs):
+[id] <Khmer translation>
+
+3. CRITICAL: You must return exactly ONE translation line for each input ID. NEVER split a single input ID into multiple output IDs (e.g. do not turn Line [1] into [1] and [2]). If a Line contains a long paragraph or multiple sentences, translate them all together on a single line starting with that ID. Do not skip any IDs.
+
+Example:
+[1] [High energy!] ជំរាបសួរអ្នកទាំងអស់គ្នា! ថ្ងៃនេះខ្ញុំនឹងនាំអ្នកទៅកាន់ពិភពថ្មីមួយ...
+[2] [Pause for suspense] ...
+
+4. Do not include any notes, formatting, introductory text, or markdown codeblocks outside of the [id] brackets.
+`;
 
     try {
       await navigator.clipboard.writeText(combinedPrompt);
-      alert("Copied full batch prompt to clipboard!");
+      alert("Copied custom localization batch prompt to clipboard!");
     } catch (err) {
       alert("Copy failed");
     }
@@ -182,17 +309,31 @@ export default function App() {
   const handlePasteAll = async () => {
     try {
       const text = await navigator.clipboard.readText();
-      
-      const regex = /\[([^\]]+)\]\s*([^\[]*)/g;
-      let match;
+      const lines = text.split("\n");
       let matchedCount = 0;
       const updates = {};
       
-      while ((match = regex.exec(text)) !== null) {
+      lines.forEach(line => {
+        // Match [id] (with optional leading space/list bullet) followed by the rest of the text
+        const match = line.match(/^\s*(?:-\s*)?\[(\d+)\]\s*(.+)/);
+        if (match) {
           const id = match[1].trim();
           const translation = match[2].trim();
           updates[id] = translation;
           matchedCount++;
+        }
+      });
+      
+      // Fallback to original global search regex if line-by-line parsing matched nothing
+      if (matchedCount === 0) {
+        const regex = /\[([^\]]+)\]\s*([^\[]*)/g;
+        let match;
+        while ((match = regex.exec(text)) !== null) {
+            const id = match[1].trim();
+            const translation = match[2].trim();
+            updates[id] = translation;
+            matchedCount++;
+        }
       }
       
       if (matchedCount > 0) {

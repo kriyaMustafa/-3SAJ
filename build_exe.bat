@@ -25,6 +25,17 @@ pyinstaller --noconfirm --onedir --windowed --name "AIVideoTranslator" ^
     --icon "app_icon.ico" ^
     --add-data "backend/dist;dist" ^
     --add-data "backend/.env;." ^
+    --add-data "backend/voice_samples;voice_samples" ^
+    --exclude-module "datasets" ^
+    --exclude-module "pyarrow" ^
+    --exclude-module "modelscope.trainers" ^
+    --exclude-module "modelscope.msdatasets" ^
+    --exclude-module "modelscope.trainers.hooks.swift" ^
+    --exclude-module "modelscope.pipelines" ^
+    --exclude-module "modelscope.pipelines.cv" ^
+    --exclude-module "modelscope.pipelines.nlp" ^
+    --exclude-module "modelscope.pipelines.multi_modal" ^
+    --exclude-module "modelscope.pipelines.audio" ^
     --hidden-import "uvicorn.logging" ^
     --hidden-import "uvicorn.loops" ^
     --hidden-import "uvicorn.loops.auto" ^
